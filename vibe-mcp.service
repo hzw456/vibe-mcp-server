@@ -1,0 +1,27 @@
+[Unit]
+Description=Vibe MCP Server - AI Task Status Tracker
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/vibe-mcp-server
+Environment="PATH=/opt/vibe-mcp-server/bin"
+EnvironmentFile=/opt/vibe-mcp-server/.env
+ExecStart=/opt/vibe-mcp-server/bin/vibe-mcp-server --host 0.0.0.0 --port 3010
+Restart=always
+RestartSec=5
+
+# 日志配置
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vibe-mcp-server
+
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/vibe-mcp-server/logs
+
+[Install]
+WantedBy=multi-user.target

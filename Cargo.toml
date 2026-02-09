@@ -1,0 +1,23 @@
+[package]
+name = "vibe-mcp-server"
+version = "1.0.0"
+edition = "2021"
+description = "AI Task Status Tracker - MCP Protocol Server with Authentication"
+authors = ["hzw456"]
+
+[dependencies]
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4" }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+env_logger = "0.10"
+dotenvy = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = true
