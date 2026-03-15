@@ -1,4 +1,4 @@
-use crate::services::task_service::{UpdateProgressRequest, UpdateStateRequest};
+use crate::services::task_service::{TaskServiceError, UpdateProgressRequest, UpdateStateRequest};
 use crate::models::TaskStatus;
 use crate::utils::helpers::{validate_status, now_millis};
 use crate::AppState;
@@ -10,6 +10,17 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+fn task_service_status(error: TaskServiceError) -> StatusCode {
+    match error {
+        TaskServiceError::NotFound => StatusCode::NOT_FOUND,
+        TaskServiceError::InvalidStatus(_) => StatusCode::BAD_REQUEST,
+    }
+}
+
+fn task_service_message(error: TaskServiceError) -> String {
+    error.to_string()
+}
 
 #[derive(Debug, Deserialize)]
 pub struct DeleteTaskRequest {
@@ -67,7 +78,10 @@ pub async fn update_task_state(
     Json(req): Json<UpdateStateRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     let user_id = crate::utils::helpers::authenticate_jwt(&headers, &state).await?;
-    state.task_service.update_task_status(&req, &user_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    state
+        .task_service
+        .update_task_status(&req, &user_id)
+        .map_err(task_service_status)?;
     Ok(Json(json!({"status": "ok"})))
 }
 
@@ -77,7 +91,10 @@ pub async fn update_task_progress(
     Json(req): Json<UpdateProgressRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     let user_id = crate::utils::helpers::authenticate_jwt(&headers, &state).await?;
-    state.task_service.update_task_progress(&req, &user_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    state
+        .task_service
+        .update_task_progress(&req, &user_id)
+        .map_err(task_service_status)?;
     Ok(Json(json!({"status": "ok"})))
 }
 
@@ -124,7 +141,7 @@ pub async fn sync_task(
     state
         .task_service
         .update_task_status(&update_req, &user_id)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(task_service_status)?;
 
     Ok(Json(json!({"status": "ok"})))
 }
@@ -232,7 +249,7 @@ pub async fn mcp_handler(
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
                         Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Task {} started", task_id) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": e }, "id": req_id })))
+                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
                     }
                 }
                 "task_progress" => {
@@ -250,7 +267,7 @@ pub async fn mcp_handler(
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
                         Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Progress updated for {}", task_id) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": e }, "id": req_id })))
+                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
                     }
                 }
                 "task_complete" => {
@@ -267,7 +284,7 @@ pub async fn mcp_handler(
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
                         Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Task {} completed", task_id) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": e }, "id": req_id })))
+                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
                     }
                 }
                 "task_error" => {
@@ -284,7 +301,7 @@ pub async fn mcp_handler(
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
                         Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Task {} marked as error", task_id) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": e }, "id": req_id })))
+                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
                     }
                 }
                 "task_cancel" => {
@@ -299,7 +316,7 @@ pub async fn mcp_handler(
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
                         Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Task {} cancelled", task_id) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": e }, "id": req_id })))
+                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
                     }
                 }
                 "task_update" => {
@@ -316,7 +333,7 @@ pub async fn mcp_handler(
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
                         Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Task {} updated to {}", task_id, status) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": e }, "id": req_id })))
+                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
                     }
                 }
                 "update_task_status" => {
@@ -328,7 +345,7 @@ pub async fn mcp_handler(
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
                         Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Task {} -> {}", task_id, status) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": e }, "id": req_id })))
+                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
                     }
                 }
                 "update_task_progress" => {
@@ -340,7 +357,7 @@ pub async fn mcp_handler(
                     };
                     match state.task_service.update_task_progress(&req, &user_id) {
                         Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Progress updated for {}", task_id) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": e }, "id": req_id })))
+                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
                     }
                 }
                 _ => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32601, "message": format!("Unknown tool: {}", tool_name) }, "id": req_id })))

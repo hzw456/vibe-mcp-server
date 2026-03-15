@@ -3,6 +3,7 @@ use crate::utils::helpers::{now_millis, validate_status};
 use serde::Deserialize;
 use sqlx::{mysql::MySqlPoolOptions, Pool, MySql, Row};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Deserialize, Default)]
@@ -31,6 +32,21 @@ pub struct UpdateProgressRequest {
     pub estimated_duration_ms: Option<i64>,
     #[serde(default)]
     pub current_stage: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskServiceError {
+    NotFound,
+    InvalidStatus(String),
+}
+
+impl fmt::Display for TaskServiceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "Task not found"),
+            Self::InvalidStatus(status) => write!(f, "Invalid status: {}", status),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -181,7 +197,19 @@ impl TaskService {
         tasks_vec
     }
 
-    pub fn update_task_status(&self, req: &UpdateStateRequest, user_id: &str) -> Result<(), String> {
+    pub fn get_task(&self, task_id: &str, user_id: &str) -> Option<Task> {
+        let tasks = self.tasks.lock().unwrap();
+        tasks
+            .get(task_id)
+            .filter(|task| task.user_id == user_id)
+            .cloned()
+    }
+
+    pub fn update_task_status(
+        &self,
+        req: &UpdateStateRequest,
+        user_id: &str,
+    ) -> Result<(), TaskServiceError> {
         let mut tasks = self.tasks.lock().unwrap();
         
         let task = tasks
@@ -197,12 +225,12 @@ impl TaskService {
             });
         
         if &task.user_id != user_id {
-            return Err("Task not found".to_string());
+            return Err(TaskServiceError::NotFound);
         }
         
         if let Some(status_str) = &req.status {
             let new_status = validate_status(status_str)
-                .ok_or_else(|| format!("Invalid status: {}", status_str))?;
+                .ok_or_else(|| TaskServiceError::InvalidStatus(status_str.clone()))?;
             
             task.status = new_status;
             
@@ -286,14 +314,18 @@ impl TaskService {
         Ok(())
     }
 
-    pub fn update_task_progress(&self, req: &UpdateProgressRequest, user_id: &str) -> Result<(), String> {
+    pub fn update_task_progress(
+        &self,
+        req: &UpdateProgressRequest,
+        user_id: &str,
+    ) -> Result<(), TaskServiceError> {
         let mut tasks = self.tasks.lock().unwrap();
         
         let task = tasks.get_mut(&req.task_id)
-            .ok_or_else(|| format!("Task not found: {}", req.task_id))?;
+            .ok_or(TaskServiceError::NotFound)?;
         
         if &task.user_id != user_id {
-            return Err("Task not found".to_string());
+            return Err(TaskServiceError::NotFound);
         }
         
         if let Some(est) = req.estimated_duration_ms {
