@@ -3,11 +3,26 @@ use crate::services::user_service::{LoginRequest, RegisterRequest, SendVerificat
 use crate::AppState;
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+pub async fn refresh_api_key(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    let user_id = crate::utils::helpers::authenticate_jwt(&headers, &state).await?;
+    
+    let new_api_key = state.user_service.regenerate_api_key(&user_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(Json(json!({
+        "success": true,
+        "api_key": new_api_key
+    })))
+}
 
 pub async fn register(
     State(state): State<Arc<AppState>>,
@@ -57,6 +72,7 @@ pub async fn login(
     Ok(Json(json!({
         "success": true,
         "token": token,
+        "api_key": user.api_key,
         "user": {
             "id": user.id,
             "email": user.email,

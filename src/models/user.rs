@@ -7,6 +7,8 @@ pub struct User {
     pub password_hash: String,
     pub created_at: i64,
     pub is_verified: bool,
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

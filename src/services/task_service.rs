@@ -13,7 +13,13 @@ pub struct UpdateStateRequest {
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
+    pub start_time: Option<i64>,
+    #[serde(default)]
     pub estimated_duration: Option<i64>,
+    #[serde(default)]
+    pub estimated_duration_ms: Option<i64>,
+    #[serde(default)]
+    pub end_time: Option<i64>,
     #[serde(default)]
     pub current_stage: Option<String>,
 }
@@ -202,12 +208,14 @@ impl TaskService {
             
             match new_status {
                 TaskStatus::Running => {
-                    if task.start_time == 0 {
+                    if let Some(start_time) = req.start_time {
+                        task.start_time = start_time;
+                    } else if task.start_time == 0 {
                         task.start_time = now_millis();
                     }
                 }
                 TaskStatus::Completed | TaskStatus::Error | TaskStatus::Cancelled => {
-                    task.end_time = Some(now_millis());
+                    task.end_time = Some(req.end_time.unwrap_or_else(now_millis));
                     if new_status == TaskStatus::Completed {
                         task.current_stage = Some("__completed__".to_string());
                     }
@@ -219,8 +227,17 @@ impl TaskService {
             }
         }
         
+        if let Some(start_time) = req.start_time {
+            task.start_time = start_time;
+        }
         if let Some(est) = req.estimated_duration {
             task.estimated_duration = Some(est);
+        }
+        if let Some(est) = req.estimated_duration_ms {
+            task.estimated_duration = Some(est);
+        }
+        if let Some(end_time) = req.end_time {
+            task.end_time = Some(end_time);
         }
         if let Some(stage) = &req.current_stage {
             task.current_stage = Some(stage.clone());

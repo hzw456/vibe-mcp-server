@@ -91,7 +91,7 @@ impl UserService {
                 };
 
                 let rows = match sqlx::query(
-                    "SELECT id, email, password_hash, is_verified, created_at FROM vibe_users"
+                    "SELECT id, email, password_hash, is_verified, created_at, api_key FROM vibe_users"
                 )
                 .fetch_all(&pool)
                 .await
@@ -123,6 +123,7 @@ impl UserService {
                             .flatten()
                             .unwrap_or(0),
                         is_verified: row.try_get("is_verified").unwrap_or(false),
+                        api_key: row.try_get("api_key").ok(),
                     };
 
                     users.insert(id, user);
@@ -164,9 +165,46 @@ impl UserService {
         users.values().find(|u| u.email == email).cloned()
     }
 
+    pub fn find_user_by_api_key(&self, api_key: &str) -> Option<User> {
+        let users = self.users.lock().unwrap();
+        users.values().find(|u| u.api_key.as_deref() == Some(api_key)).cloned()
+    }
+
     pub fn find_user_by_id(&self, id: &str) -> Option<User> {
         let users = self.users.lock().unwrap();
         users.get(id).cloned()
+    }
+
+    pub fn regenerate_api_key(&self, user_id: &str) -> Result<String, ()> {
+        let mut users = self.users.lock().unwrap();
+        if let Some(user) = users.get_mut(user_id) {
+            let new_key = generate_id();
+            user.api_key = Some(new_key.clone());
+            
+            // Update in database
+            if !self.db_url.is_empty() {
+                let db_url = self.db_url.clone();
+                let uid = user_id.to_string();
+                let key = new_key.clone();
+                tokio::spawn(async move {
+                    let pool = MySqlPoolOptions::new()
+                        .max_connections(1)
+                        .connect(&db_url).await;
+                    if let Ok(pool) = pool {
+                        let _ = sqlx::query(
+                            "UPDATE vibe_users SET api_key = ? WHERE id = ?"
+                        )
+                        .bind(&key)
+                        .bind(&uid)
+                        .execute(&pool)
+                        .await;
+                    }
+                });
+            }
+            
+            return Ok(new_key);
+        }
+        Err(())
     }
 
     pub fn create_user(&self, email: &str, password_hash: &str) -> User {
@@ -177,6 +215,7 @@ impl UserService {
             password_hash: password_hash.to_string(),
             created_at: now_millis(),
             is_verified: false,
+            api_key: Some(generate_id()),
         };
         users.insert(user.id.clone(), user.clone());
         
@@ -187,6 +226,7 @@ impl UserService {
             let user_hash = user.password_hash.clone();
             let user_verified = user.is_verified;
             let user_created = user.created_at;
+            let user_api_key = user.api_key.clone();
             
             tokio::spawn(async move {
                 let pool = MySqlPoolOptions::new()
@@ -194,13 +234,14 @@ impl UserService {
                     .connect(&db_url).await;
                 if let Ok(pool) = pool {
                     let _ = sqlx::query(
-                        "INSERT INTO vibe_users (id, email, password_hash, is_verified, created_at) VALUES (?, ?, ?, ?, ?)"
+                        "INSERT INTO vibe_users (id, email, password_hash, is_verified, created_at, api_key) VALUES (?, ?, ?, ?, ?, ?)"
                     )
                     .bind(&user_id)
                     .bind(&user_email)
                     .bind(&user_hash)
                     .bind(user_verified)
                     .bind(user_created)
+                    .bind(&user_api_key)
                     .execute(&pool).await;
                 }
             });
@@ -237,6 +278,25 @@ impl UserService {
         for user in users.values_mut() {
             if user.email == email {
                 user.is_verified = true;
+                
+                // Also update database
+                if !self.db_url.is_empty() {
+                    let db_url = self.db_url.clone();
+                    let user_email = email.to_string();
+                    tokio::spawn(async move {
+                        let pool = MySqlPoolOptions::new()
+                            .max_connections(1)
+                            .connect(&db_url).await;
+                        if let Ok(pool) = pool {
+                            let _ = sqlx::query(
+                                "UPDATE vibe_users SET is_verified = TRUE WHERE email = ?"
+                            )
+                            .bind(&user_email)
+                            .execute(&pool)
+                            .await;
+                        }
+                    });
+                }
                 break;
             }
         }

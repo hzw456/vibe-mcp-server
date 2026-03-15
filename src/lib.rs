@@ -48,6 +48,7 @@ pub fn create_router(state: AppState) -> Router {
         // Auth endpoints
         .route("/api/auth/register", post(handlers::register))
         .route("/api/auth/login", post(handlers::login))
+        .route("/api/auth/refresh-api-key", post(handlers::refresh_api_key))
         .route("/api/auth/send-verification", post(handlers::send_verification))
         .route("/api/auth/verify", post(handlers::verify_code))
         .route("/api/sync/task", post(handlers::sync_task))
