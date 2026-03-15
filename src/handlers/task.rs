@@ -1,5 +1,6 @@
 use crate::services::task_service::{UpdateProgressRequest, UpdateStateRequest};
 use crate::models::TaskStatus;
+use crate::utils::helpers::validate_status;
 use crate::AppState;
 use axum::{
     extract::State,
@@ -24,7 +25,7 @@ pub struct ResetRequest {
 #[derive(Debug, Deserialize)]
 pub struct SyncTaskRequest {
     pub task_id: String,
-    pub status: TaskStatus,
+    pub status: String,
     #[serde(default)]
     pub current_stage: Option<String>,
     #[serde(default)]
@@ -78,6 +79,7 @@ pub async fn sync_task(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SyncTaskRequest>,
 ) -> Result<Json<Value>, StatusCode> {
+    let status = validate_status(&req.status).ok_or(StatusCode::BAD_REQUEST)?;
     let user_email = req
         .user_email
         .as_deref()
@@ -90,7 +92,7 @@ pub async fn sync_task(
         .ok_or(StatusCode::BAD_REQUEST)?;
     let update_req = UpdateStateRequest {
         task_id: req.task_id,
-        status: Some(format!("{:?}", req.status).to_lowercase()),
+        status: Some(format!("{:?}", status).to_lowercase()),
         source: Some("sync".to_string()),
         estimated_duration: None,
         current_stage: req.current_stage,
@@ -210,7 +212,6 @@ pub async fn health() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::SyncTaskRequest;
-    use crate::models::TaskStatus;
     use serde_json::json;
 
     #[test]
@@ -224,7 +225,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(req.task_id, "task-123");
-        assert_eq!(req.status, TaskStatus::Running);
+        assert_eq!(req.status, "running");
         assert_eq!(req.current_stage.as_deref(), Some("Analyzing"));
         assert_eq!(req.user_email.as_deref(), Some("user@example.com"));
     }
@@ -238,7 +239,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(req.task_id, "task-123");
-        assert_eq!(req.status, TaskStatus::Completed);
+        assert_eq!(req.status, "completed");
         assert_eq!(req.current_stage, None);
         assert_eq!(req.user_email, None);
     }
