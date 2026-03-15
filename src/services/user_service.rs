@@ -1,36 +1,177 @@
+use crate::models::{User, VerificationCode};
+use crate::utils::helpers::{generate_id, now_millis};
+use chrono::{Duration, Utc};
+use serde::Deserialize;
+use sqlx::{mysql::MySqlPoolOptions, Pool, MySql, Row};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use crate::utils::helpers::{now_millis, generate_id};
-use crate::services::auth_service::{hash_password, generate_verification_code};
-use chrono::{Duration, Utc};
 
-#[derive(Clone)]
+#[derive(Debug, Deserialize)]
+pub struct RegisterRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SendVerificationRequest {
+    pub email: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyCodeRequest {
+    pub email: String,
+    pub code: String,
+}
+
 pub struct UserService {
-    pub users: Arc<Mutex<HashMap<String, crate::models::User>>>,
-    pub verification_codes: Arc<Mutex<HashMap<String, crate::models::VerificationCode>>>,
+    pub users: Arc<Mutex<HashMap<String, User>>>,
+    pub verification_codes: Arc<Mutex<HashMap<String, VerificationCode>>>,
+    pub db: Option<Pool<MySql>>,
+    pub db_url: String,
+}
+
+impl Clone for UserService {
+    fn clone(&self) -> Self {
+        Self {
+            users: Arc::clone(&self.users),
+            verification_codes: Arc::clone(&self.verification_codes),
+            db: None,
+            db_url: self.db_url.clone(),
+        }
+    }
 }
 
 impl UserService {
-    pub fn new() -> Self {
+    pub fn new(db_url: String) -> Self {
+        let users = if db_url.is_empty() {
+            HashMap::new()
+        } else {
+            Self::load_users_from_db(&db_url)
+        };
+
         Self {
-            users: Arc::new(Mutex::new(HashMap::new())),
+            users: Arc::new(Mutex::new(users)),
             verification_codes: Arc::new(Mutex::new(HashMap::new())),
+            db: None,
+            db_url,
         }
     }
 
-    pub fn find_user_by_email(&self, email: &str) -> Option<crate::models::User> {
+    fn load_users_from_db(db_url: &str) -> HashMap<String, User> {
+        let db_url = db_url.to_string();
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!("Failed to create startup DB runtime: {}", error);
+                    return HashMap::new();
+                }
+            };
+
+            runtime.block_on(async move {
+                let pool = match MySqlPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&db_url)
+                    .await
+                {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        tracing::warn!("Failed to connect to database during user load: {}", error);
+                        return HashMap::new();
+                    }
+                };
+
+                let rows = match sqlx::query(
+                    "SELECT id, email, password_hash, is_verified, created_at FROM vibe_users"
+                )
+                .fetch_all(&pool)
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        tracing::warn!("Failed to load users from database: {}", error);
+                        return HashMap::new();
+                    }
+                };
+
+                let mut users = HashMap::with_capacity(rows.len());
+                for row in rows {
+                    let id: String = match row.try_get("id") {
+                        Ok(id) => id,
+                        Err(error) => {
+                            tracing::warn!("Skipping user row without valid id: {}", error);
+                            continue;
+                        }
+                    };
+
+                    let user = User {
+                        id: id.clone(),
+                        email: row.try_get("email").unwrap_or_default(),
+                        password_hash: row.try_get("password_hash").unwrap_or_default(),
+                        created_at: row
+                            .try_get::<Option<i64>, _>("created_at")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0),
+                        is_verified: row.try_get("is_verified").unwrap_or(false),
+                    };
+
+                    users.insert(id, user);
+                }
+
+                tracing::info!("Loaded {} users from database", users.len());
+                users
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| {
+            tracing::warn!("User loading thread panicked during startup");
+            HashMap::new()
+        })
+    }
+
+    pub async fn init_db(&self) -> Option<Pool<MySql>> {
+        if self.db_url.is_empty() {
+            return None;
+        }
+        match MySqlPoolOptions::new()
+            .max_connections(5)
+            .connect(&self.db_url)
+            .await
+        {
+            Ok(pool) => {
+                tracing::info!("Connected to database");
+                Some(pool)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to connect to database: {}", e);
+                None
+            }
+        }
+    }
+
+    pub fn find_user_by_email(&self, email: &str) -> Option<User> {
         let users = self.users.lock().unwrap();
         users.values().find(|u| u.email == email).cloned()
     }
 
-    pub fn find_user_by_id(&self, id: &str) -> Option<crate::models::User> {
+    pub fn find_user_by_id(&self, id: &str) -> Option<User> {
         let users = self.users.lock().unwrap();
         users.get(id).cloned()
     }
 
-    pub fn create_user(&self, email: &str, password_hash: &str) -> crate::models::User {
+    pub fn create_user(&self, email: &str, password_hash: &str) -> User {
         let mut users = self.users.lock().unwrap();
-        let user = crate::models::User {
+        let user = User {
             id: generate_id(),
             email: email.to_string(),
             password_hash: password_hash.to_string(),
@@ -38,6 +179,33 @@ impl UserService {
             is_verified: false,
         };
         users.insert(user.id.clone(), user.clone());
+        
+        if !self.db_url.is_empty() {
+            let db_url = self.db_url.clone();
+            let user_id = user.id.clone();
+            let user_email = user.email.clone();
+            let user_hash = user.password_hash.clone();
+            let user_verified = user.is_verified;
+            let user_created = user.created_at;
+            
+            tokio::spawn(async move {
+                let pool = MySqlPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&db_url).await;
+                if let Ok(pool) = pool {
+                    let _ = sqlx::query(
+                        "INSERT INTO vibe_users (id, email, password_hash, is_verified, created_at) VALUES (?, ?, ?, ?, ?)"
+                    )
+                    .bind(&user_id)
+                    .bind(&user_email)
+                    .bind(&user_hash)
+                    .bind(user_verified)
+                    .bind(user_created)
+                    .execute(&pool).await;
+                }
+            });
+        }
+        
         user
     }
 
@@ -47,7 +215,7 @@ impl UserService {
             .checked_add_signed(Duration::minutes(expires_minutes))
             .unwrap()
             .timestamp_millis();
-        codes.insert(email.to_string(), crate::models::VerificationCode {
+        codes.insert(email.to_string(), VerificationCode {
             code: code.to_string(),
             expires_at,
         });

@@ -1,0 +1,49 @@
+{
+  "version": "1",
+  "dialect": "mysql",
+  "tables": [
+    {
+      "name": "vibe_users",
+      "columns": [
+        {"name": "id", "type": "VARCHAR(36)", "not_null": true, "primary_key": true},
+        {"name": "email", "type": "VARCHAR(255)", "not_null": true, "primary_key": false},
+        {"name": "password_hash", "type": "VARCHAR(255)", "not_null": true, "primary_key": false},
+        {"name": "is_verified", "type": "BOOLEAN", "not_null": false, "primary_key": false},
+        {"name": "created_at", "type": "BIGINT", "not_null": true, "primary_key": false},
+        {"name": "updated_at", "type": "BIGINT", "not_null": true, "primary_key": false}
+      ]
+    },
+    {
+      "name": "vibe_tasks",
+      "columns": [
+        {"name": "id", "type": "VARCHAR(36)", "not_null": true, "primary_key": true},
+        {"name": "user_id", "type": "VARCHAR(36)", "not_null": true, "primary_key": false},
+        {"name": "parent_task_id", "type": "VARCHAR(36)", "not_null": false, "primary_key": false},
+        {"name": "name", "type": "VARCHAR(255)", "not_null": true, "primary_key": false},
+        {"name": "status", "type": "VARCHAR(20)", "not_null": false, "primary_key": false},
+        {"name": "current_stage", "type": "TEXT", "not_null": false, "primary_key": false},
+        {"name": "source", "type": "VARCHAR(50)", "not_null": false, "primary_key": false},
+        {"name": "ide", "type": "VARCHAR(255)", "not_null": false, "primary_key": false},
+        {"name": "window_title", "type": "VARCHAR(500)", "not_null": false, "primary_key": false},
+        {"name": "project_path", "type": "VARCHAR(1000)", "not_null": false, "primary_key": false},
+        {"name": "active_file", "type": "VARCHAR(1000)", "not_null": false, "primary_key": false},
+        {"name": "is_focused", "type": "BOOLEAN", "not_null": false, "primary_key": false},
+        {"name": "start_time", "type": "BIGINT", "not_null": false, "primary_key": false},
+        {"name": "end_time", "type": "BIGINT", "not_null": false, "primary_key": false},
+        {"name": "last_heartbeat", "type": "BIGINT", "not_null": true, "primary_key": false},
+        {"name": "estimated_duration_ms", "type": "BIGINT", "not_null": false, "primary_key": false},
+        {"name": "created_at", "type": "BIGINT", "not_null": true, "primary_key": false},
+        {"name": "updated_at", "type": "BIGINT", "not_null": true, "primary_key": false}
+      ]
+    },
+    {
+      "name": "vibe_verification_codes",
+      "columns": [
+        {"name": "email", "type": "VARCHAR(255)", "not_null": true, "primary_key": true},
+        {"name": "code", "type": "VARCHAR(10)", "not_null": true, "primary_key": false},
+        {"name": "expires_at", "type": "BIGINT", "not_null": true, "primary_key": false},
+        {"name": "created_at", "type": "BIGINT", "not_null": true, "primary_key": false}
+      ]
+    }
+  ]
+}

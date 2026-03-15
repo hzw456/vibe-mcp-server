@@ -1,0 +1,15 @@
+[[bin]]
+name = "db_migrate"
+path = "db_migrate.rs"
+
+[[bin]]
+name = "db_test"
+path = "db_test.rs"
+
+[package]
+name = "vibe-mcp-migrate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mysql = "25"

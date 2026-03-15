@@ -1,0 +1,29 @@
+-- Migration: Create vibe_tasks table
+-- Run after 001_users.sql
+
+CREATE TABLE IF NOT EXISTS vibe_tasks (
+    id VARCHAR(36) PRIMARY KEY,
+    user_id VARCHAR(36) NOT NULL,
+    parent_task_id VARCHAR(36) NULL,
+    name VARCHAR(255) NOT NULL,
+    status ENUM('armed', 'running', 'completed', 'error', 'cancelled') DEFAULT 'armed',
+    current_stage TEXT NULL,
+    source VARCHAR(50) DEFAULT 'mcp',
+    ide VARCHAR(255) NULL,
+    window_title VARCHAR(500) NULL,
+    project_path VARCHAR(1000) NULL,
+    active_file VARCHAR(1000) NULL,
+    is_focused BOOLEAN DEFAULT FALSE,
+    start_time BIGINT NULL,
+    end_time BIGINT NULL,
+    last_heartbeat BIGINT NULL,
+    estimated_duration_ms BIGINT NULL,
+    created_at BIGINT NOT NULL DEFAULT (UNIX_TIMESTAMP() * 1000),
+    updated_at BIGINT NOT NULL DEFAULT (UNIX_TIMESTAMP() * 1000),
+    FOREIGN KEY (user_id) REFERENCES vibe_users(id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_task_id) REFERENCES vibe_tasks(id) ON DELETE SET NULL,
+    INDEX idx_user_id (user_id),
+    INDEX idx_status (status),
+    INDEX idx_parent_id (parent_task_id),
+    INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

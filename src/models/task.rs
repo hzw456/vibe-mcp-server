@@ -31,8 +31,7 @@ pub struct Task {
 
 impl Task {
     pub fn new(id: String, user_id: String, name: String, ide: String, window_title: String) -> Self {
-        use chrono::Utc;
-        let now = Utc::now().timestamp_millis();
+        let now = chrono::Utc::now().timestamp_millis();
         Self {
             id,
             user_id,
