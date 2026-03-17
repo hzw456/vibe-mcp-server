@@ -31,7 +31,7 @@ pub async fn authenticate_jwt(
     state: &Arc<crate::AppState>,
 ) -> Result<String, StatusCode> {
     use crate::services::auth_service::AuthService;
-    
+
     if let Some(auth_header) = headers.get("authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
             if auth_str.starts_with("Bearer ") {
@@ -52,7 +52,7 @@ pub async fn authenticate(
     state: &Arc<crate::AppState>,
 ) -> Result<String, StatusCode> {
     use crate::services::auth_service::AuthService;
-    
+
     // Try JWT first
     if let Some(auth_header) = headers.get("authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
@@ -65,7 +65,7 @@ pub async fn authenticate(
             }
         }
     }
-    
+
     // Fallback to API Key
     if let Some(key) = headers.get("x-api-key") {
         if key.to_str().map_or(false, |s| s == api_key) {

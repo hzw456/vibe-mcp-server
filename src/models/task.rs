@@ -29,8 +29,23 @@ pub struct Task {
     pub current_stage: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskStageHistory {
+    pub task_id: String,
+    pub stage: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub duration: Option<i64>,
+}
+
 impl Task {
-    pub fn new(id: String, user_id: String, name: String, ide: String, window_title: String) -> Self {
+    pub fn new(
+        id: String,
+        user_id: String,
+        name: String,
+        ide: String,
+        window_title: String,
+    ) -> Self {
         let now = chrono::Utc::now().timestamp_millis();
         Self {
             id,

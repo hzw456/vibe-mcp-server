@@ -1,7 +1,7 @@
-use crate::models::{Task, TaskStatus};
+use crate::models::{Task, TaskStageHistory, TaskStatus};
 use crate::utils::helpers::{now_millis, validate_status};
 use serde::Deserialize;
-use sqlx::{mysql::MySqlPoolOptions, Pool, MySql, Row};
+use sqlx::{mysql::MySqlPoolOptions, MySql, Pool, Row};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -52,6 +52,7 @@ impl fmt::Display for TaskServiceError {
 #[derive(Clone)]
 pub struct TaskService {
     pub tasks: Arc<Mutex<HashMap<String, Task>>>,
+    pub stage_histories: Arc<Mutex<HashMap<String, Vec<TaskStageHistory>>>>,
     pub db: Option<Pool<MySql>>,
     pub db_url: String,
 }
@@ -63,11 +64,148 @@ impl TaskService {
         } else {
             Self::load_tasks_from_db(&db_url)
         };
-        
+
         Self {
             tasks: Arc::new(Mutex::new(tasks)),
+            stage_histories: Arc::new(Mutex::new(HashMap::new())),
             db: None,
             db_url,
+        }
+    }
+
+    fn status_to_history_stage(status: TaskStatus, current_stage: Option<&str>) -> String {
+        match status {
+            TaskStatus::Armed => "armed".to_string(),
+            TaskStatus::Running => current_stage.unwrap_or("running").to_string(),
+            TaskStatus::Completed => current_stage.unwrap_or("__completed__").to_string(),
+            TaskStatus::Error => current_stage.unwrap_or("error").to_string(),
+            TaskStatus::Cancelled => current_stage.unwrap_or("cancelled").to_string(),
+        }
+    }
+
+    fn should_record_stage_history(req: &UpdateStateRequest) -> bool {
+        req.current_stage.is_some() || req.status.is_some()
+    }
+
+    fn should_finalize_stage(status: Option<TaskStatus>) -> bool {
+        matches!(
+            status,
+            Some(TaskStatus::Completed | TaskStatus::Error | TaskStatus::Cancelled)
+        )
+    }
+
+    fn record_stage_history_in_memory(
+        &self,
+        task_id: &str,
+        stage: &str,
+        started_at: i64,
+        finalize_at: Option<i64>,
+    ) {
+        let mut histories = self.stage_histories.lock().unwrap();
+        let entries = histories.entry(task_id.to_string()).or_default();
+
+        if let Some(last) = entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.ended_at.is_none())
+        {
+            last.ended_at = Some(started_at);
+            last.duration = Some((started_at - last.started_at).max(0));
+        }
+
+        let ended_at = finalize_at;
+        entries.push(TaskStageHistory {
+            task_id: task_id.to_string(),
+            stage: stage.to_string(),
+            started_at,
+            ended_at,
+            duration: ended_at.map(|ended_at| (ended_at - started_at).max(0)),
+        });
+    }
+
+    pub fn get_task_stage_history(&self, task_id: &str) -> Vec<TaskStageHistory> {
+        self.stage_histories
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    async fn persist_task_and_stage_history(
+        db_url: String,
+        task: Task,
+        stage_event: Option<String>,
+        stage_started_at: i64,
+        stage_finalize_at: Option<i64>,
+    ) {
+        let pool = MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&db_url)
+            .await;
+        if let Ok(pool) = pool {
+            let status_str = format!("{:?}", task.status).to_lowercase();
+            if let Ok(mut tx) = pool.begin().await {
+                let task_query = sqlx::query(
+                    "INSERT INTO vibe_tasks (id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status = ?, end_time = ?, last_heartbeat = ?, estimated_duration_ms = ?, current_stage = ?"
+                )
+                .bind(&task.id)
+                .bind(&task.user_id)
+                .bind(&task.name)
+                .bind(&status_str)
+                .bind(&task.source)
+                .bind(task.start_time)
+                .bind(task.end_time)
+                .bind(task.last_heartbeat)
+                .bind(task.estimated_duration)
+                .bind(&task.current_stage)
+                .bind(&status_str)
+                .bind(task.end_time)
+                .bind(task.last_heartbeat)
+                .bind(task.estimated_duration)
+                .bind(&task.current_stage)
+                .execute(&mut *tx)
+                .await;
+
+                if task_query.is_err() {
+                    let _ = tx.rollback().await;
+                    return;
+                }
+
+                if let Some(stage) = stage_event {
+                    let close_previous = sqlx::query(
+                        "UPDATE vibe_task_stages SET ended_at = ?, duration = GREATEST(? - started_at, 0) WHERE task_id = ? AND ended_at IS NULL"
+                    )
+                    .bind(stage_started_at)
+                    .bind(stage_started_at)
+                    .bind(&task.id)
+                    .execute(&mut *tx)
+                    .await;
+
+                    if close_previous.is_err() {
+                        let _ = tx.rollback().await;
+                        return;
+                    }
+
+                    let insert_stage = sqlx::query(
+                        "INSERT INTO vibe_task_stages (task_id, stage, started_at, ended_at, duration) VALUES (?, ?, ?, ?, ?)"
+                    )
+                    .bind(&task.id)
+                    .bind(&stage)
+                    .bind(stage_started_at)
+                    .bind(stage_finalize_at)
+                    .bind(stage_finalize_at.map(|ended_at| (ended_at - stage_started_at).max(0)))
+                    .execute(&mut *tx)
+                    .await;
+
+                    if insert_stage.is_err() {
+                        let _ = tx.rollback().await;
+                        return;
+                    }
+                }
+
+                let _ = tx.commit().await;
+            }
         }
     }
 
@@ -189,7 +327,11 @@ impl TaskService {
     pub fn get_tasks(&self, user_id: Option<&str>) -> Vec<Task> {
         let tasks = self.tasks.lock().unwrap();
         let mut tasks_vec: Vec<Task> = if let Some(uid) = user_id {
-            tasks.values().filter(|t| &t.user_id == uid).cloned().collect()
+            tasks
+                .values()
+                .filter(|t| &t.user_id == uid)
+                .cloned()
+                .collect()
         } else {
             tasks.values().cloned().collect()
         };
@@ -211,39 +353,39 @@ impl TaskService {
         user_id: &str,
     ) -> Result<(), TaskServiceError> {
         let mut tasks = self.tasks.lock().unwrap();
-        
-        let task = tasks
-            .entry(req.task_id.clone())
-            .or_insert_with(|| {
-                Task::new(
-                    req.task_id.clone(),
-                    user_id.to_string(),
-                    req.task_id.clone(),
-                    "IDE".to_string(),
-                    req.task_id.clone(),
-                )
-            });
-        
+
+        let task = tasks.entry(req.task_id.clone()).or_insert_with(|| {
+            Task::new(
+                req.task_id.clone(),
+                user_id.to_string(),
+                req.task_id.clone(),
+                "IDE".to_string(),
+                req.task_id.clone(),
+            )
+        });
+
         if &task.user_id != user_id {
             return Err(TaskServiceError::NotFound);
         }
-        
+
+        let now = now_millis();
+        let mut history_status = None;
         if let Some(status_str) = &req.status {
             let new_status = validate_status(status_str)
                 .ok_or_else(|| TaskServiceError::InvalidStatus(status_str.clone()))?;
-            
+            history_status = Some(new_status);
             task.status = new_status;
-            
+
             match new_status {
                 TaskStatus::Running => {
                     if let Some(start_time) = req.start_time {
                         task.start_time = start_time;
                     } else if task.start_time == 0 {
-                        task.start_time = now_millis();
+                        task.start_time = now;
                     }
                 }
                 TaskStatus::Completed | TaskStatus::Error | TaskStatus::Cancelled => {
-                    task.end_time = Some(req.end_time.unwrap_or_else(now_millis));
+                    task.end_time = Some(req.end_time.unwrap_or(now));
                     if new_status == TaskStatus::Completed {
                         task.current_stage = Some("__completed__".to_string());
                     }
@@ -254,7 +396,7 @@ impl TaskService {
                 }
             }
         }
-        
+
         if let Some(start_time) = req.start_time {
             task.start_time = start_time;
         }
@@ -273,44 +415,56 @@ impl TaskService {
         if let Some(source) = &req.source {
             task.source = source.clone();
         }
-        
-        task.last_heartbeat = now_millis();
-        
-        // Save to database asynchronously
+
+        task.last_heartbeat = now;
+
+        let stage_event = if Self::should_record_stage_history(req) {
+            Some(req.current_stage.clone().unwrap_or_else(|| {
+                Self::status_to_history_stage(task.status, task.current_stage.as_deref())
+            }))
+        } else {
+            None
+        };
+        let stage_started_at = if Self::should_finalize_stage(history_status) {
+            task.end_time.unwrap_or(now)
+        } else if history_status == Some(TaskStatus::Running) && task.start_time > 0 {
+            task.start_time
+        } else {
+            now
+        };
+        let stage_finalize_at = if Self::should_finalize_stage(history_status) {
+            Some(stage_started_at)
+        } else {
+            None
+        };
+
         let task_clone = task.clone();
         let db_url = self.db_url.clone();
         drop(tasks);
-        
+
+        if let Some(stage) = &stage_event {
+            self.record_stage_history_in_memory(
+                &task_clone.id,
+                stage,
+                stage_started_at,
+                stage_finalize_at,
+            );
+        }
+
         if !db_url.is_empty() {
+            let stage_event_clone = stage_event.clone();
             tokio::spawn(async move {
-                let pool = MySqlPoolOptions::new()
-                    .max_connections(1)
-                    .connect(&db_url).await;
-                if let Ok(pool) = pool {
-                    let status_str = format!("{:?}", task_clone.status).to_lowercase();
-                    let _ = sqlx::query(
-                        "INSERT INTO vibe_tasks (id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status = ?, end_time = ?, last_heartbeat = ?, estimated_duration_ms = ?, current_stage = ?"
-                    )
-                    .bind(&task_clone.id)
-                    .bind(&task_clone.user_id)
-                    .bind(&task_clone.name)
-                    .bind(&status_str)
-                    .bind(&task_clone.source)
-                    .bind(task_clone.start_time)
-                    .bind(task_clone.end_time)
-                    .bind(task_clone.last_heartbeat)
-                    .bind(task_clone.estimated_duration)
-                    .bind(&task_clone.current_stage)
-                    .bind(&status_str)
-                    .bind(task_clone.end_time)
-                    .bind(task_clone.last_heartbeat)
-                    .bind(task_clone.estimated_duration)
-                    .bind(&task_clone.current_stage)
-                    .execute(&pool).await;
-                }
+                Self::persist_task_and_stage_history(
+                    db_url,
+                    task_clone,
+                    stage_event_clone,
+                    stage_started_at,
+                    stage_finalize_at,
+                )
+                .await;
             });
         }
-        
+
         Ok(())
     }
 
@@ -320,71 +474,62 @@ impl TaskService {
         user_id: &str,
     ) -> Result<(), TaskServiceError> {
         let mut tasks = self.tasks.lock().unwrap();
-        
-        let task = tasks.get_mut(&req.task_id)
+
+        let task = tasks
+            .get_mut(&req.task_id)
             .ok_or(TaskServiceError::NotFound)?;
-        
+
         if &task.user_id != user_id {
             return Err(TaskServiceError::NotFound);
         }
-        
+
+        let now = now_millis();
         if let Some(est) = req.estimated_duration_ms {
             task.estimated_duration = Some(est);
         }
         if let Some(stage) = &req.current_stage {
             task.current_stage = Some(stage.clone());
         }
-        
-        task.last_heartbeat = now_millis();
-        
+
+        task.last_heartbeat = now;
+
+        let stage_event = req.current_stage.clone();
         let task_clone = task.clone();
         let db_url = self.db_url.clone();
         drop(tasks);
-        
+
+        if let Some(stage) = &stage_event {
+            self.record_stage_history_in_memory(&task_clone.id, stage, now, None);
+        }
+
         if !db_url.is_empty() {
+            let stage_event_clone = stage_event.clone();
             tokio::spawn(async move {
-                let pool = MySqlPoolOptions::new()
-                    .max_connections(1)
-                    .connect(&db_url).await;
-                if let Ok(pool) = pool {
-                    let status_str = format!("{:?}", task_clone.status).to_lowercase();
-                    let _ = sqlx::query(
-                        "INSERT INTO vibe_tasks (id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status = ?, end_time = ?, last_heartbeat = ?, estimated_duration_ms = ?, current_stage = ?"
-                    )
-                    .bind(&task_clone.id)
-                    .bind(&task_clone.user_id)
-                    .bind(&task_clone.name)
-                    .bind(&status_str)
-                    .bind(&task_clone.source)
-                    .bind(task_clone.start_time)
-                    .bind(task_clone.end_time)
-                    .bind(task_clone.last_heartbeat)
-                    .bind(task_clone.estimated_duration)
-                    .bind(&task_clone.current_stage)
-                    .bind(&status_str)
-                    .bind(task_clone.end_time)
-                    .bind(task_clone.last_heartbeat)
-                    .bind(task_clone.estimated_duration)
-                    .bind(&task_clone.current_stage)
-                    .execute(&pool).await;
-                }
+                Self::persist_task_and_stage_history(
+                    db_url,
+                    task_clone,
+                    stage_event_clone,
+                    now,
+                    None,
+                )
+                .await;
             });
         }
-        
+
         Ok(())
     }
 
     pub fn reset_tasks(&self, task_id: Option<String>, user_id: &str) {
         let mut tasks = self.tasks.lock().unwrap();
         match task_id {
-            Some(id) => { 
+            Some(id) => {
                 if let Some(task) = tasks.get(&id) {
                     if task.user_id == user_id {
                         tasks.remove(&id);
                     }
                 }
             }
-            None => { 
+            None => {
                 tasks.retain(|_, t| t.user_id != user_id);
             }
         }
@@ -411,5 +556,101 @@ impl TaskService {
             }
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TaskService, UpdateProgressRequest, UpdateStateRequest};
+    use crate::models::TaskStatus;
+
+    fn create_task_service() -> TaskService {
+        TaskService::new(String::new())
+    }
+
+    #[test]
+    fn records_stage_history_for_current_stage_updates() {
+        let service = create_task_service();
+
+        service
+            .update_task_status(
+                &UpdateStateRequest {
+                    task_id: "task-1".to_string(),
+                    status: Some("running".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        service
+            .update_task_progress(
+                &UpdateProgressRequest {
+                    task_id: "task-1".to_string(),
+                    current_stage: Some("Planning".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        service
+            .update_task_progress(
+                &UpdateProgressRequest {
+                    task_id: "task-1".to_string(),
+                    current_stage: Some("Implementing".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        let history = service.get_task_stage_history("task-1");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].stage, "running");
+        assert_eq!(history[1].stage, "Planning");
+        assert_eq!(history[2].stage, "Implementing");
+        assert!(history[0].ended_at.is_some());
+        assert!(history[1].ended_at.is_some());
+        assert_eq!(history[2].ended_at, None);
+    }
+
+    #[test]
+    fn records_terminal_status_as_closed_stage_history() {
+        let service = create_task_service();
+
+        service
+            .update_task_status(
+                &UpdateStateRequest {
+                    task_id: "task-2".to_string(),
+                    status: Some("running".to_string()),
+                    current_stage: Some("Coding".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        service
+            .update_task_status(
+                &UpdateStateRequest {
+                    task_id: "task-2".to_string(),
+                    status: Some("completed".to_string()),
+                    end_time: Some(1_710_000_000_000),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        let tasks = service.get_tasks(Some("user-1"));
+        assert_eq!(tasks[0].status, TaskStatus::Completed);
+
+        let history = service.get_task_stage_history("task-2");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].stage, "Coding");
+        assert_eq!(history[1].stage, "__completed__");
+        assert_eq!(history[1].ended_at, Some(1_710_000_000_000));
+        assert_eq!(history[1].duration, Some(0));
     }
 }

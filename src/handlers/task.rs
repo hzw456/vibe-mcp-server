@@ -1,6 +1,6 @@
-use crate::services::task_service::{TaskServiceError, UpdateProgressRequest, UpdateStateRequest};
 use crate::models::TaskStatus;
-use crate::utils::helpers::{validate_status, now_millis};
+use crate::services::task_service::{TaskServiceError, UpdateProgressRequest, UpdateStateRequest};
+use crate::utils::helpers::{now_millis, validate_status};
 use crate::AppState;
 use axum::{
     extract::State,
@@ -108,12 +108,12 @@ pub async fn sync_task(
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    
+
     let user_id = match api_key {
-        Some(key) => {
-            state.user_service.find_user_by_api_key(&key)
-                .map(|user| user.id)
-        },
+        Some(key) => state
+            .user_service
+            .find_user_by_api_key(&key)
+            .map(|user| user.id),
         None => {
             // Fallback to user_email for backward compatibility (deprecated)
             let user_email = req
@@ -121,12 +121,16 @@ pub async fn sync_task(
                 .as_deref()
                 .filter(|email| !email.trim().is_empty())
                 .unwrap_or("test@vibe.app");
-            state.user_service.find_user_by_email(user_email).map(|user| user.id)
+            state
+                .user_service
+                .find_user_by_email(user_email)
+                .map(|user| user.id)
         }
-    }.ok_or(StatusCode::UNAUTHORIZED)?;
-    
+    }
+    .ok_or(StatusCode::UNAUTHORIZED)?;
+
     let status = validate_status(&req.status).ok_or(StatusCode::BAD_REQUEST)?;
-    
+
     let update_req = UpdateStateRequest {
         task_id: req.task_id,
         status: Some(format!("{:?}", status).to_lowercase()),
@@ -178,22 +182,28 @@ pub async fn mcp_handler(
 ) -> Result<Json<Value>, StatusCode> {
     // Authenticate: try API key first, then JWT
     let user_id = {
-        if let Some(api_key) = headers.get("x-api-key")
+        if let Some(api_key) = headers
+            .get("x-api-key")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
         {
-            state.user_service.find_user_by_api_key(&api_key)
+            state
+                .user_service
+                .find_user_by_api_key(&api_key)
                 .map(|user| user.id)
         } else {
             // Try JWT
-            crate::utils::helpers::authenticate_jwt(&headers, &state).await.ok()
+            crate::utils::helpers::authenticate_jwt(&headers, &state)
+                .await
+                .ok()
         }
-    }.ok_or(StatusCode::UNAUTHORIZED)?;
-    
+    }
+    .ok_or(StatusCode::UNAUTHORIZED)?;
+
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or_default();
     let req_id = req.get("id").cloned();
-    
+
     let result = match method {
         "initialize" => json!({
             "protocolVersion": "2024-11-05",
@@ -201,11 +211,13 @@ pub async fn mcp_handler(
             "serverInfo": { "name": "vibe-mcp-server", "version": "1.0.0" }
         }),
         "notifications/initialized" => {
-            return Ok(Json(json!({ "jsonrpc": "2.0", "result": {}, "id": req_id })));
+            return Ok(Json(
+                json!({ "jsonrpc": "2.0", "result": {}, "id": req_id }),
+            ));
         }
         "tools/list" => json!({
             "tools": [
-                { "name": "list_tasks", "description": "Get all tasks for the authenticated user", 
+                { "name": "list_tasks", "description": "Get all tasks for the authenticated user",
                   "inputSchema": { "type": "object", "properties": {}, "required": [] } },
                 { "name": "task_start", "description": "Start a new task",
                   "inputSchema": { "type": "object", "properties": { "task_id": { "type": "string" }, "name": { "type": "string" }, "description": { "type": "string" } }, "required": ["task_id", "name"] } },
@@ -224,7 +236,7 @@ pub async fn mcp_handler(
         "tools/call" => {
             let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_default();
-            
+
             match tool_name {
                 "list_tasks" => {
                     let tasks = state.task_service.get_tasks(Some(&user_id));
@@ -237,8 +249,11 @@ pub async fn mcp_handler(
                 "task_start" => {
                     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
                     let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("Task");
-                    let description = args.get("description").and_then(|v| v.as_str()).unwrap_or(name);
-                    
+                    let description = args
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(name);
+
                     let req = UpdateStateRequest {
                         task_id: task_id.to_string(),
                         status: Some("running".to_string()),
@@ -248,16 +263,27 @@ pub async fn mcp_handler(
                         ..Default::default()
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
-                        Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Task {} started", task_id) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
+                        Ok(_) => {
+                            json!({ "content": [{ "type": "text", "text": format!("Task {} started", task_id) }] })
+                        }
+                        Err(e) => {
+                            return Ok(Json(
+                                json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id }),
+                            ))
+                        }
                     }
                 }
                 "task_progress" => {
                     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let current_stage = args.get("current_stage").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let current_stage = args
+                        .get("current_stage")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     let progress = args.get("progress").and_then(|v| v.as_f64());
-                    
-                    let stage = current_stage.unwrap_or_else(|| format!("Progress: {}%", progress.unwrap_or(0.0) as i32));
+
+                    let stage = current_stage.unwrap_or_else(|| {
+                        format!("Progress: {}%", progress.unwrap_or(0.0) as i32)
+                    });
                     let req = UpdateStateRequest {
                         task_id: task_id.to_string(),
                         status: Some("running".to_string()),
@@ -266,14 +292,23 @@ pub async fn mcp_handler(
                         ..Default::default()
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
-                        Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Progress updated for {}", task_id) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
+                        Ok(_) => {
+                            json!({ "content": [{ "type": "text", "text": format!("Progress updated for {}", task_id) }] })
+                        }
+                        Err(e) => {
+                            return Ok(Json(
+                                json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id }),
+                            ))
+                        }
                     }
                 }
                 "task_complete" => {
                     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let current_stage = args.get("current_stage").and_then(|v| v.as_str()).unwrap_or("Task completed");
-                    
+                    let current_stage = args
+                        .get("current_stage")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Task completed");
+
                     let req = UpdateStateRequest {
                         task_id: task_id.to_string(),
                         status: Some("completed".to_string()),
@@ -283,14 +318,23 @@ pub async fn mcp_handler(
                         ..Default::default()
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
-                        Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Task {} completed", task_id) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
+                        Ok(_) => {
+                            json!({ "content": [{ "type": "text", "text": format!("Task {} completed", task_id) }] })
+                        }
+                        Err(e) => {
+                            return Ok(Json(
+                                json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id }),
+                            ))
+                        }
                     }
                 }
                 "task_error" => {
                     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("Task failed");
-                    
+                    let message = args
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Task failed");
+
                     let req = UpdateStateRequest {
                         task_id: task_id.to_string(),
                         status: Some("error".to_string()),
@@ -300,13 +344,19 @@ pub async fn mcp_handler(
                         ..Default::default()
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
-                        Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Task {} marked as error", task_id) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
+                        Ok(_) => {
+                            json!({ "content": [{ "type": "text", "text": format!("Task {} marked as error", task_id) }] })
+                        }
+                        Err(e) => {
+                            return Ok(Json(
+                                json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id }),
+                            ))
+                        }
                     }
                 }
                 "task_cancel" => {
                     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-                    
+
                     let req = UpdateStateRequest {
                         task_id: task_id.to_string(),
                         status: Some("cancelled".to_string()),
@@ -315,15 +365,27 @@ pub async fn mcp_handler(
                         ..Default::default()
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
-                        Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Task {} cancelled", task_id) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
+                        Ok(_) => {
+                            json!({ "content": [{ "type": "text", "text": format!("Task {} cancelled", task_id) }] })
+                        }
+                        Err(e) => {
+                            return Ok(Json(
+                                json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id }),
+                            ))
+                        }
                     }
                 }
                 "task_update" => {
                     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("running");
-                    let current_stage = args.get("current_stage").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    
+                    let status = args
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("running");
+                    let current_stage = args
+                        .get("current_stage")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
                     let req = UpdateStateRequest {
                         task_id: task_id.to_string(),
                         status: Some(status.to_string()),
@@ -332,41 +394,76 @@ pub async fn mcp_handler(
                         ..Default::default()
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
-                        Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Task {} updated to {}", task_id, status) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
+                        Ok(_) => {
+                            json!({ "content": [{ "type": "text", "text": format!("Task {} updated to {}", task_id, status) }] })
+                        }
+                        Err(e) => {
+                            return Ok(Json(
+                                json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id }),
+                            ))
+                        }
                     }
                 }
                 "update_task_status" => {
                     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
                     let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
                     let req = UpdateStateRequest {
-                        task_id: task_id.to_string(), status: Some(status.to_string()), 
-                        source: Some("mcp".to_string()), ..Default::default()
+                        task_id: task_id.to_string(),
+                        status: Some(status.to_string()),
+                        source: Some("mcp".to_string()),
+                        ..Default::default()
                     };
                     match state.task_service.update_task_status(&req, &user_id) {
-                        Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Task {} -> {}", task_id, status) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
+                        Ok(_) => {
+                            json!({ "content": [{ "type": "text", "text": format!("Task {} -> {}", task_id, status) }] })
+                        }
+                        Err(e) => {
+                            return Ok(Json(
+                                json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id }),
+                            ))
+                        }
                     }
                 }
                 "update_task_progress" => {
                     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
                     let req = UpdateProgressRequest {
                         task_id: task_id.to_string(),
-                        estimated_duration_ms: args.get("estimated_duration_ms").and_then(|v| v.as_i64()),
-                        current_stage: args.get("current_stage").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        estimated_duration_ms: args
+                            .get("estimated_duration_ms")
+                            .and_then(|v| v.as_i64()),
+                        current_stage: args
+                            .get("current_stage")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                     };
                     match state.task_service.update_task_progress(&req, &user_id) {
-                        Ok(_) => json!({ "content": [{ "type": "text", "text": format!("Progress updated for {}", task_id) }] }),
-                        Err(e) => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id })))
+                        Ok(_) => {
+                            json!({ "content": [{ "type": "text", "text": format!("Progress updated for {}", task_id) }] })
+                        }
+                        Err(e) => {
+                            return Ok(Json(
+                                json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": task_service_message(e) }, "id": req_id }),
+                            ))
+                        }
                     }
                 }
-                _ => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32601, "message": format!("Unknown tool: {}", tool_name) }, "id": req_id })))
+                _ => {
+                    return Ok(Json(
+                        json!({ "jsonrpc": "2.0", "error": { "code": -32601, "message": format!("Unknown tool: {}", tool_name) }, "id": req_id }),
+                    ))
+                }
             }
         }
-        _ => return Ok(Json(json!({ "jsonrpc": "2.0", "error": { "code": -32601, "message": format!("Method: {}", method) }, "id": req_id })))
+        _ => {
+            return Ok(Json(
+                json!({ "jsonrpc": "2.0", "error": { "code": -32601, "message": format!("Method: {}", method) }, "id": req_id }),
+            ))
+        }
     };
-    
-    Ok(Json(json!({ "jsonrpc": "2.0", "result": result, "id": req_id })))
+
+    Ok(Json(
+        json!({ "jsonrpc": "2.0", "result": result, "id": req_id }),
+    ))
 }
 
 pub async fn health() -> &'static str {

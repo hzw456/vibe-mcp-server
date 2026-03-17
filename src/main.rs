@@ -7,14 +7,14 @@ use vibe_mcp_server::{create_router, Config};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = dotenvy::dotenv();
     env_logger::init();
-    
+
     let config = Config::default();
     let state = vibe_mcp_server::AppState::new(config.clone());
     let router = create_router(state);
-    
+
     let addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    
+
     println!("🚀 Vibe MCP Server started on {}", addr);
     println!("📡 Health: http://{}:{}/health", addr, config.port);
     println!("🔐 Auth:   http://{}:{}/api/auth/login", addr, config.port);
@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   API_KEY={}", config.api_key);
     println!("   JWT_SECRET={}", config.jwt_secret);
     println!("   JWT_EXPIRY_HOURS={}", config.jwt_expiry_hours);
-    
+
     axum::serve(listener, router).await?;
     Ok(())
 }

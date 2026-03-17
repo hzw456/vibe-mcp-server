@@ -157,6 +157,20 @@ mysql://username:password@host:port/database_name
 | created_at | TIMESTAMP | 创建时间 |
 | updated_at | TIMESTAMP | 更新时间 |
 
+#### vibe_task_stages
+任务阶段历史表，记录每次阶段切换的起止时间与耗时。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | BIGINT | 自增主键 |
+| task_id | VARCHAR(36) | 关联任务 ID |
+| stage | TEXT | 阶段名称 |
+| started_at | BIGINT | 阶段开始时间（毫秒） |
+| ended_at | BIGINT | 阶段结束时间（毫秒） |
+| duration | BIGINT | 阶段耗时（毫秒） |
+| created_at | BIGINT | 创建时间 |
+| updated_at | BIGINT | 更新时间 |
+
 #### vibe_verification_codes
 验证码表，存储邮箱验证码。
 

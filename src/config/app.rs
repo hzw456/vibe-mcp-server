@@ -16,8 +16,12 @@ impl Default for Config {
             host: "0.0.0.0".to_string(),
             port: 3010,
             api_key: std::env::var("API_KEY").unwrap_or_else(|_| "vibe-mcp-secret-key".to_string()),
-            jwt_secret: std::env::var("JWT_SECRET").unwrap_or_else(|_| "vibe-jwt-secret-key-change-in-production".to_string()),
-            jwt_expiry_hours: std::env::var("JWT_EXPIRY_HOURS").unwrap_or_else(|_| "24".to_string()).parse().unwrap_or(24),
+            jwt_secret: std::env::var("JWT_SECRET")
+                .unwrap_or_else(|_| "vibe-jwt-secret-key-change-in-production".to_string()),
+            jwt_expiry_hours: std::env::var("JWT_EXPIRY_HOURS")
+                .unwrap_or_else(|_| "24".to_string())
+                .parse()
+                .unwrap_or(24),
             database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
         }
     }

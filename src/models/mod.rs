@@ -1,7 +1,7 @@
-pub mod user;
-pub mod task;
 pub mod auth;
+pub mod task;
+pub mod user;
 
-pub use user::{User, VerificationCode};
-pub use task::{Task, TaskStatus};
 pub use auth::Claims;
+pub use task::{Task, TaskStageHistory, TaskStatus};
+pub use user::{User, VerificationCode};
