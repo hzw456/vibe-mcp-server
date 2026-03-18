@@ -54,6 +54,7 @@ CREATE TABLE vibe_task_stages (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     task_id VARCHAR(36) NOT NULL,
     stage TEXT NOT NULL,
+    description TEXT NULL,
     started_at BIGINT NOT NULL,
     ended_at BIGINT NULL,
     duration BIGINT NULL,

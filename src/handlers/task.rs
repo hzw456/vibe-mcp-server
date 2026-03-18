@@ -223,7 +223,7 @@ pub async fn mcp_handler(
                 { "name": "task_start", "description": "Start a new task",
                   "inputSchema": { "type": "object", "properties": { "task_id": { "type": "string" }, "name": { "type": "string" }, "description": { "type": "string" } }, "required": ["task_id", "name"] } },
                 { "name": "task_progress", "description": "Update task progress",
-                  "inputSchema": { "type": "object", "properties": { "task_id": { "type": "string" }, "progress": { "type": "number" }, "current_stage": { "type": "string" } }, "required": ["task_id"] } },
+                  "inputSchema": { "type": "object", "properties": { "task_id": { "type": "string" }, "progress": { "type": "number" }, "current_stage": { "type": "string" }, "active_file": { "type": "string" } }, "required": ["task_id"] } },
                 { "name": "task_complete", "description": "Mark task as completed",
                   "inputSchema": { "type": "object", "properties": { "task_id": { "type": "string" }, "current_stage": { "type": "string" } }, "required": ["task_id"] } },
                 { "name": "task_error", "description": "Mark task as error",
@@ -281,18 +281,21 @@ pub async fn mcp_handler(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
                     let progress = args.get("progress").and_then(|v| v.as_f64());
+                    let active_file = args
+                        .get("active_file")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
 
                     let stage = current_stage.unwrap_or_else(|| {
                         format!("Progress: {}%", progress.unwrap_or(0.0) as i32)
                     });
-                    let req = UpdateStateRequest {
+                    let req = UpdateProgressRequest {
                         task_id: task_id.to_string(),
-                        status: Some("running".to_string()),
-                        source: Some("mcp".to_string()),
                         current_stage: Some(stage),
+                        active_file,
                         ..Default::default()
                     };
-                    match state.task_service.update_task_status(&req, &user_id) {
+                    match state.task_service.update_task_progress(&req, &user_id) {
                         Ok(_) => {
                             json!({ "content": [{ "type": "text", "text": format!("Progress updated for {}", task_id) }] })
                         }
@@ -434,6 +437,10 @@ pub async fn mcp_handler(
                             .and_then(|v| v.as_i64()),
                         current_stage: args
                             .get("current_stage")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        active_file: args
+                            .get("active_file")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
                         ..Default::default()

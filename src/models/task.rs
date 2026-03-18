@@ -33,6 +33,7 @@ pub struct Task {
 pub struct TaskStageHistory {
     pub task_id: String,
     pub stage: String,
+    pub description: Option<String>,
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub duration: Option<i64>,

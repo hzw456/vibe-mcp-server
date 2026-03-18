@@ -48,6 +48,12 @@ pub struct UpdateProgressRequest {
     pub is_focused: Option<bool>,
 }
 
+#[derive(Debug, Clone)]
+struct StageEvent {
+    stage: String,
+    description: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskServiceError {
     NotFound,
@@ -97,25 +103,37 @@ impl TaskService {
             .map(ToOwned::to_owned)
     }
 
+    fn normalized_description(description: Option<&str>) -> Option<String> {
+        Self::normalized_stage(description)
+    }
+
     fn stage_event_for_state(
         req: &UpdateStateRequest,
         status: Option<TaskStatus>,
         current_stage: Option<&str>,
-    ) -> Option<String> {
+    ) -> Option<StageEvent> {
         if let Some(stage) = Self::normalized_stage(req.current_stage.as_deref()) {
-            return Some(stage);
+            return Some(StageEvent {
+                stage,
+                description: None,
+            });
         }
 
         match status {
-            Some(TaskStatus::Completed) => {
-                Self::normalized_stage(current_stage).or_else(|| Some("__completed__".to_string()))
-            }
-            Some(TaskStatus::Error) => {
-                Self::normalized_stage(current_stage).or_else(|| Some("error".to_string()))
-            }
-            Some(TaskStatus::Cancelled) => {
-                Self::normalized_stage(current_stage).or_else(|| Some("cancelled".to_string()))
-            }
+            Some(TaskStatus::Completed) => Some(StageEvent {
+                stage: Self::normalized_stage(current_stage)
+                    .unwrap_or_else(|| "__completed__".to_string()),
+                description: None,
+            }),
+            Some(TaskStatus::Error) => Some(StageEvent {
+                stage: Self::normalized_stage(current_stage).unwrap_or_else(|| "error".to_string()),
+                description: None,
+            }),
+            Some(TaskStatus::Cancelled) => Some(StageEvent {
+                stage: Self::normalized_stage(current_stage)
+                    .unwrap_or_else(|| "cancelled".to_string()),
+                description: None,
+            }),
             _ => None,
         }
     }
@@ -124,11 +142,15 @@ impl TaskService {
         req: &UpdateProgressRequest,
         current_stage: Option<&str>,
         active_file: Option<&str>,
-    ) -> Option<String> {
-        Self::normalized_stage(req.current_stage.as_deref())
-            .or_else(|| Self::normalized_stage(current_stage))
-            .or_else(|| Self::normalized_stage(req.active_file.as_deref()))
+    ) -> Option<StageEvent> {
+        let stage = Self::normalized_stage(req.active_file.as_deref())
             .or_else(|| Self::normalized_stage(active_file))
+            .or_else(|| Self::normalized_stage(req.current_stage.as_deref()))
+            .or_else(|| Self::normalized_stage(current_stage))?;
+        let description = Self::normalized_description(req.current_stage.as_deref())
+            .or_else(|| Self::normalized_description(current_stage));
+
+        Some(StageEvent { stage, description })
     }
 
     fn should_finalize_stage(status: Option<TaskStatus>) -> bool {
@@ -141,7 +163,7 @@ impl TaskService {
     fn record_stage_history_in_memory(
         &self,
         task_id: &str,
-        stage: &str,
+        stage_event: &StageEvent,
         started_at: i64,
         finalize_at: Option<i64>,
     ) {
@@ -153,7 +175,10 @@ impl TaskService {
             .rev()
             .find(|entry| entry.ended_at.is_none())
         {
-            if last.stage == stage {
+            if last.stage == stage_event.stage {
+                if stage_event.description.is_some() {
+                    last.description = stage_event.description.clone();
+                }
                 if let Some(ended_at) = finalize_at {
                     last.ended_at = Some(ended_at.max(last.started_at));
                     last.duration = Some((ended_at - last.started_at).max(0));
@@ -169,7 +194,8 @@ impl TaskService {
         let ended_at = finalize_at;
         entries.push(TaskStageHistory {
             task_id: task_id.to_string(),
-            stage: stage.to_string(),
+            stage: stage_event.stage.clone(),
+            description: stage_event.description.clone(),
             started_at,
             ended_at,
             duration: ended_at.map(|ended_at| (ended_at - started_at).max(0)),
@@ -198,7 +224,7 @@ impl TaskService {
     async fn persist_task_and_stage_history(
         db_url: String,
         task: Task,
-        stage_event: Option<String>,
+        stage_event: Option<StageEvent>,
         stage_started_at: i64,
         stage_finalize_at: Option<i64>,
     ) {
@@ -235,7 +261,7 @@ impl TaskService {
                     return;
                 }
 
-                if let Some(stage) = stage_event {
+                if let Some(stage_event) = stage_event {
                     let close_previous = sqlx::query(
                         "UPDATE vibe_task_stages SET ended_at = ?, duration = GREATEST(? - started_at, 0) WHERE task_id = ? AND ended_at IS NULL"
                     )
@@ -251,10 +277,11 @@ impl TaskService {
                     }
 
                     let insert_stage = sqlx::query(
-                        "INSERT INTO vibe_task_stages (task_id, stage, started_at, ended_at, duration) VALUES (?, ?, ?, ?, ?)"
+                        "INSERT INTO vibe_task_stages (task_id, stage, description, started_at, ended_at, duration) VALUES (?, ?, ?, ?, ?, ?)"
                     )
                     .bind(&task.id)
-                    .bind(&stage)
+                    .bind(&stage_event.stage)
+                    .bind(&stage_event.description)
                     .bind(stage_started_at)
                     .bind(stage_finalize_at)
                     .bind(stage_finalize_at.map(|ended_at| (ended_at - stage_started_at).max(0)))
@@ -398,7 +425,7 @@ impl TaskService {
                 };
 
                 let rows = match sqlx::query(
-                    "SELECT task_id, stage, started_at, ended_at, duration FROM vibe_task_stages ORDER BY task_id ASC, started_at ASC, id ASC"
+                    "SELECT task_id, stage, description, started_at, ended_at, duration FROM vibe_task_stages ORDER BY task_id ASC, started_at ASC, id ASC"
                 )
                 .fetch_all(&pool)
                 .await
@@ -423,6 +450,7 @@ impl TaskService {
                     histories.entry(task_id.clone()).or_default().push(TaskStageHistory {
                         task_id,
                         stage: row.try_get("stage").unwrap_or_default(),
+                        description: row.try_get("description").ok(),
                         started_at: row.try_get("started_at").unwrap_or(0),
                         ended_at: row.try_get("ended_at").ok(),
                         duration: row.try_get("duration").ok(),
@@ -472,7 +500,7 @@ impl TaskService {
                 };
 
                 let rows = match sqlx::query(
-                    "SELECT task_id, stage, started_at, ended_at, duration FROM vibe_task_stages WHERE task_id = ? ORDER BY started_at ASC, id ASC"
+                    "SELECT task_id, stage, description, started_at, ended_at, duration FROM vibe_task_stages WHERE task_id = ? ORDER BY started_at ASC, id ASC"
                 )
                 .bind(&task_id)
                 .fetch_all(&pool)
@@ -489,6 +517,7 @@ impl TaskService {
                     .map(|row| TaskStageHistory {
                         task_id: row.try_get("task_id").unwrap_or_default(),
                         stage: row.try_get("stage").unwrap_or_default(),
+                        description: row.try_get("description").ok(),
                         started_at: row.try_get("started_at").unwrap_or(0),
                         ended_at: row.try_get("ended_at").ok(),
                         duration: row.try_get("duration").ok(),
@@ -827,7 +856,9 @@ mod tests {
         let history = service.get_task_stage_history("task-1");
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].stage, "Planning");
+        assert_eq!(history[0].description, Some("Planning".to_string()));
         assert_eq!(history[1].stage, "Implementing");
+        assert_eq!(history[1].description, Some("Implementing".to_string()));
         assert!(history[0].ended_at.is_some());
         assert_eq!(history[1].ended_at, None);
     }
@@ -861,7 +892,8 @@ mod tests {
 
         let history = service.get_task_stage_history("task-priority");
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].stage, "refactoring code");
+        assert_eq!(history[0].stage, "rpc_query_nds.cc");
+        assert_eq!(history[0].description, Some("refactoring code".to_string()));
     }
 
     #[test]
@@ -893,6 +925,55 @@ mod tests {
         let history = service.get_task_stage_history("task-file-fallback");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].stage, "src/lib.rs");
+        assert_eq!(history[0].description, None);
+    }
+
+    #[test]
+    fn updates_description_for_repeated_progress_on_same_stage() {
+        let service = create_task_service();
+
+        service
+            .update_task_status(
+                &UpdateStateRequest {
+                    task_id: "task-desc".to_string(),
+                    status: Some("running".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        service
+            .update_task_progress(
+                &UpdateProgressRequest {
+                    task_id: "task-desc".to_string(),
+                    active_file: Some("src/lib.rs".to_string()),
+                    current_stage: Some("Drafting changes".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        service
+            .update_task_progress(
+                &UpdateProgressRequest {
+                    task_id: "task-desc".to_string(),
+                    active_file: Some("src/lib.rs".to_string()),
+                    current_stage: Some("Polishing edge cases".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        let history = service.get_task_stage_history("task-desc");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].stage, "src/lib.rs");
+        assert_eq!(
+            history[0].description,
+            Some("Polishing edge cases".to_string())
+        );
     }
 
     #[test]
@@ -987,7 +1068,9 @@ mod tests {
         let history = service.get_task_stage_history("task-2");
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].stage, "Coding");
+        assert_eq!(history[0].description, None);
         assert_eq!(history[1].stage, "__completed__");
+        assert_eq!(history[1].description, None);
         assert_eq!(history[1].ended_at, Some(1_710_000_000_000));
         assert_eq!(history[1].duration, Some(0));
     }
