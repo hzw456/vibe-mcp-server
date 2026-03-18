@@ -1,9 +1,9 @@
 use crate::models::TaskStatus;
 use crate::services::task_service::{TaskServiceError, UpdateProgressRequest, UpdateStateRequest};
-use crate::utils::helpers::{now_millis, validate_status};
+use crate::utils::helpers::{authenticate_user, now_millis, validate_status};
 use crate::AppState;
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -77,7 +77,7 @@ pub async fn update_task_state(
     headers: HeaderMap,
     Json(req): Json<UpdateStateRequest>,
 ) -> Result<Json<Value>, StatusCode> {
-    let user_id = crate::utils::helpers::authenticate_jwt(&headers, &state).await?;
+    let user_id = authenticate_user(&headers, &state).await?;
     state
         .task_service
         .update_task_status(&req, &user_id)
@@ -90,7 +90,7 @@ pub async fn update_task_progress(
     headers: HeaderMap,
     Json(req): Json<UpdateProgressRequest>,
 ) -> Result<Json<Value>, StatusCode> {
-    let user_id = crate::utils::helpers::authenticate_jwt(&headers, &state).await?;
+    let user_id = authenticate_user(&headers, &state).await?;
     state
         .task_service
         .update_task_progress(&req, &user_id)
@@ -140,6 +140,7 @@ pub async fn sync_task(
         estimated_duration_ms: req.estimated_duration_ms,
         end_time: req.end_time,
         current_stage: req.current_stage,
+        ..Default::default()
     };
 
     state
@@ -435,6 +436,7 @@ pub async fn mcp_handler(
                             .get("current_stage")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
+                        ..Default::default()
                     };
                     match state.task_service.update_task_progress(&req, &user_id) {
                         Ok(_) => {
@@ -526,4 +528,19 @@ mod tests {
         }))
         .is_err());
     }
+}
+
+pub async fn get_task_stage_history(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let user_id = authenticate_user(&headers, &state).await?;
+    if state.task_service.get_task(&task_id, &user_id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let history = state.task_service.get_task_stage_history(&task_id);
+    Ok(Json(
+        json!({ "task_id": task_id, "stages": history, "stageCount": history.len() }),
+    ))
 }

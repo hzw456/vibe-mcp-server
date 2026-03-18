@@ -23,6 +23,14 @@ pub struct UpdateStateRequest {
     pub end_time: Option<i64>,
     #[serde(default)]
     pub current_stage: Option<String>,
+    #[serde(default)]
+    pub window_title: Option<String>,
+    #[serde(default)]
+    pub active_file: Option<String>,
+    #[serde(default)]
+    pub project_path: Option<String>,
+    #[serde(default)]
+    pub is_focused: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -32,6 +40,12 @@ pub struct UpdateProgressRequest {
     pub estimated_duration_ms: Option<i64>,
     #[serde(default)]
     pub current_stage: Option<String>,
+    #[serde(default)]
+    pub active_file: Option<String>,
+    #[serde(default)]
+    pub window_title: Option<String>,
+    #[serde(default)]
+    pub is_focused: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,32 +73,51 @@ pub struct TaskService {
 
 impl TaskService {
     pub fn new(db_url: String) -> Self {
-        let tasks = if db_url.is_empty() {
-            HashMap::new()
+        let (tasks, stage_histories) = if db_url.is_empty() {
+            (HashMap::new(), HashMap::new())
         } else {
-            Self::load_tasks_from_db(&db_url)
+            (
+                Self::load_tasks_from_db(&db_url),
+                Self::load_stage_histories_from_db(&db_url),
+            )
         };
 
         Self {
             tasks: Arc::new(Mutex::new(tasks)),
-            stage_histories: Arc::new(Mutex::new(HashMap::new())),
+            stage_histories: Arc::new(Mutex::new(stage_histories)),
             db: None,
             db_url,
         }
     }
 
-    fn status_to_history_stage(status: TaskStatus, current_stage: Option<&str>) -> String {
-        match status {
-            TaskStatus::Armed => "armed".to_string(),
-            TaskStatus::Running => current_stage.unwrap_or("running").to_string(),
-            TaskStatus::Completed => current_stage.unwrap_or("__completed__").to_string(),
-            TaskStatus::Error => current_stage.unwrap_or("error").to_string(),
-            TaskStatus::Cancelled => current_stage.unwrap_or("cancelled").to_string(),
-        }
+    fn normalized_stage(stage: Option<&str>) -> Option<String> {
+        stage
+            .map(str::trim)
+            .filter(|stage| !stage.is_empty())
+            .map(ToOwned::to_owned)
     }
 
-    fn should_record_stage_history(req: &UpdateStateRequest) -> bool {
-        req.current_stage.is_some() || req.status.is_some()
+    fn stage_event_for_state(
+        req: &UpdateStateRequest,
+        status: Option<TaskStatus>,
+        current_stage: Option<&str>,
+    ) -> Option<String> {
+        if let Some(stage) = Self::normalized_stage(req.current_stage.as_deref()) {
+            return Some(stage);
+        }
+
+        match status {
+            Some(TaskStatus::Completed) => {
+                Self::normalized_stage(current_stage).or_else(|| Some("__completed__".to_string()))
+            }
+            Some(TaskStatus::Error) => {
+                Self::normalized_stage(current_stage).or_else(|| Some("error".to_string()))
+            }
+            Some(TaskStatus::Cancelled) => {
+                Self::normalized_stage(current_stage).or_else(|| Some("cancelled".to_string()))
+            }
+            _ => None,
+        }
     }
 
     fn should_finalize_stage(status: Option<TaskStatus>) -> bool {
@@ -109,8 +142,17 @@ impl TaskService {
             .rev()
             .find(|entry| entry.ended_at.is_none())
         {
-            last.ended_at = Some(started_at);
-            last.duration = Some((started_at - last.started_at).max(0));
+            if last.stage == stage {
+                if let Some(ended_at) = finalize_at {
+                    last.ended_at = Some(ended_at.max(last.started_at));
+                    last.duration = Some((ended_at - last.started_at).max(0));
+                }
+                return;
+            }
+
+            let closed_at = started_at.max(last.started_at);
+            last.ended_at = Some(closed_at);
+            last.duration = Some((closed_at - last.started_at).max(0));
         }
 
         let ended_at = finalize_at;
@@ -124,12 +166,22 @@ impl TaskService {
     }
 
     pub fn get_task_stage_history(&self, task_id: &str) -> Vec<TaskStageHistory> {
-        self.stage_histories
-            .lock()
-            .unwrap()
-            .get(task_id)
-            .cloned()
-            .unwrap_or_default()
+        if let Some(history) = self.stage_histories.lock().unwrap().get(task_id).cloned() {
+            return history;
+        }
+
+        if self.db_url.is_empty() {
+            return Vec::new();
+        }
+
+        let history = Self::load_stage_history_from_db(&self.db_url, task_id);
+        if !history.is_empty() {
+            self.stage_histories
+                .lock()
+                .unwrap()
+                .insert(task_id.to_string(), history.clone());
+        }
+        history
     }
 
     async fn persist_task_and_stage_history(
@@ -147,7 +199,7 @@ impl TaskService {
             let status_str = format!("{:?}", task.status).to_lowercase();
             if let Ok(mut tx) = pool.begin().await {
                 let task_query = sqlx::query(
-                    "INSERT INTO vibe_tasks (id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status = ?, end_time = ?, last_heartbeat = ?, estimated_duration_ms = ?, current_stage = ?"
+                    "INSERT INTO vibe_tasks (id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage, ide, window_title, project_path, active_file, is_focused) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), name = VALUES(name), status = VALUES(status), source = VALUES(source), start_time = VALUES(start_time), end_time = VALUES(end_time), last_heartbeat = VALUES(last_heartbeat), estimated_duration_ms = VALUES(estimated_duration_ms), current_stage = VALUES(current_stage), ide = VALUES(ide), window_title = VALUES(window_title), project_path = VALUES(project_path), active_file = VALUES(active_file), is_focused = VALUES(is_focused)"
                 )
                 .bind(&task.id)
                 .bind(&task.user_id)
@@ -159,11 +211,11 @@ impl TaskService {
                 .bind(task.last_heartbeat)
                 .bind(task.estimated_duration)
                 .bind(&task.current_stage)
-                .bind(&status_str)
-                .bind(task.end_time)
-                .bind(task.last_heartbeat)
-                .bind(task.estimated_duration)
-                .bind(&task.current_stage)
+                .bind(&task.ide)
+                .bind(&task.window_title)
+                .bind(&task.project_path)
+                .bind(&task.active_file)
+                .bind(task.is_focused)
                 .execute(&mut *tx)
                 .await;
 
@@ -304,6 +356,142 @@ impl TaskService {
         })
     }
 
+    fn load_stage_histories_from_db(db_url: &str) -> HashMap<String, Vec<TaskStageHistory>> {
+        let db_url = db_url.to_string();
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!("Failed to create startup DB runtime for stage history: {}", error);
+                    return HashMap::new();
+                }
+            };
+
+            runtime.block_on(async move {
+                let pool = match MySqlPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&db_url)
+                    .await
+                {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        tracing::warn!(
+                            "Failed to connect to database during stage history load: {}",
+                            error
+                        );
+                        return HashMap::new();
+                    }
+                };
+
+                let rows = match sqlx::query(
+                    "SELECT task_id, stage, started_at, ended_at, duration FROM vibe_task_stages ORDER BY task_id ASC, started_at ASC, id ASC"
+                )
+                .fetch_all(&pool)
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        tracing::warn!("Failed to load stage histories from database: {}", error);
+                        return HashMap::new();
+                    }
+                };
+
+                let mut histories: HashMap<String, Vec<TaskStageHistory>> = HashMap::new();
+                for row in rows {
+                    let task_id: String = match row.try_get("task_id") {
+                        Ok(task_id) => task_id,
+                        Err(error) => {
+                            tracing::warn!("Skipping stage row without valid task_id: {}", error);
+                            continue;
+                        }
+                    };
+
+                    histories.entry(task_id.clone()).or_default().push(TaskStageHistory {
+                        task_id,
+                        stage: row.try_get("stage").unwrap_or_default(),
+                        started_at: row.try_get("started_at").unwrap_or(0),
+                        ended_at: row.try_get("ended_at").ok(),
+                        duration: row.try_get("duration").ok(),
+                    });
+                }
+
+                histories
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| {
+            tracing::warn!("Stage history loading thread panicked during startup");
+            HashMap::new()
+        })
+    }
+
+    fn load_stage_history_from_db(db_url: &str, task_id: &str) -> Vec<TaskStageHistory> {
+        let db_url = db_url.to_string();
+        let task_id = task_id.to_string();
+
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!("Failed to create runtime for lazy stage history load: {}", error);
+                    return Vec::new();
+                }
+            };
+
+            runtime.block_on(async move {
+                let pool = match MySqlPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&db_url)
+                    .await
+                {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        tracing::warn!(
+                            "Failed to connect to database during lazy stage history load: {}",
+                            error
+                        );
+                        return Vec::new();
+                    }
+                };
+
+                let rows = match sqlx::query(
+                    "SELECT task_id, stage, started_at, ended_at, duration FROM vibe_task_stages WHERE task_id = ? ORDER BY started_at ASC, id ASC"
+                )
+                .bind(&task_id)
+                .fetch_all(&pool)
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        tracing::warn!("Failed to load stage history for task {}: {}", task_id, error);
+                        return Vec::new();
+                    }
+                };
+
+                rows.into_iter()
+                    .map(|row| TaskStageHistory {
+                        task_id: row.try_get("task_id").unwrap_or_default(),
+                        stage: row.try_get("stage").unwrap_or_default(),
+                        started_at: row.try_get("started_at").unwrap_or(0),
+                        ended_at: row.try_get("ended_at").ok(),
+                        duration: row.try_get("duration").ok(),
+                    })
+                    .collect()
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| {
+            tracing::warn!("Lazy stage history loading thread panicked");
+            Vec::new()
+        })
+    }
+
     pub async fn init_db(&self) -> Option<Pool<MySql>> {
         if self.db_url.is_empty() {
             return None;
@@ -415,16 +603,23 @@ impl TaskService {
         if let Some(source) = &req.source {
             task.source = source.clone();
         }
+        if let Some(window_title) = &req.window_title {
+            task.window_title = window_title.clone();
+        }
+        if let Some(active_file) = &req.active_file {
+            task.active_file = Some(active_file.clone());
+        }
+        if let Some(project_path) = &req.project_path {
+            task.project_path = Some(project_path.clone());
+        }
+        if let Some(is_focused) = req.is_focused {
+            task.is_focused = is_focused;
+        }
 
         task.last_heartbeat = now;
 
-        let stage_event = if Self::should_record_stage_history(req) {
-            Some(req.current_stage.clone().unwrap_or_else(|| {
-                Self::status_to_history_stage(task.status, task.current_stage.as_deref())
-            }))
-        } else {
-            None
-        };
+        let stage_event =
+            Self::stage_event_for_state(req, history_status, task.current_stage.as_deref());
         let stage_started_at = if Self::should_finalize_stage(history_status) {
             task.end_time.unwrap_or(now)
         } else if history_status == Some(TaskStatus::Running) && task.start_time > 0 {
@@ -490,10 +685,19 @@ impl TaskService {
         if let Some(stage) = &req.current_stage {
             task.current_stage = Some(stage.clone());
         }
+        if let Some(active_file) = &req.active_file {
+            task.active_file = Some(active_file.clone());
+        }
+        if let Some(window_title) = &req.window_title {
+            task.window_title = window_title.clone();
+        }
+        if let Some(is_focused) = req.is_focused {
+            task.is_focused = is_focused;
+        }
 
         task.last_heartbeat = now;
 
-        let stage_event = req.current_stage.clone();
+        let stage_event = Self::normalized_stage(req.current_stage.as_deref());
         let task_clone = task.clone();
         let db_url = self.db_url.clone();
         drop(tasks);
@@ -606,13 +810,69 @@ mod tests {
             .unwrap();
 
         let history = service.get_task_stage_history("task-1");
-        assert_eq!(history.len(), 3);
-        assert_eq!(history[0].stage, "running");
-        assert_eq!(history[1].stage, "Planning");
-        assert_eq!(history[2].stage, "Implementing");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].stage, "Planning");
+        assert_eq!(history[1].stage, "Implementing");
         assert!(history[0].ended_at.is_some());
-        assert!(history[1].ended_at.is_some());
-        assert_eq!(history[2].ended_at, None);
+        assert_eq!(history[1].ended_at, None);
+    }
+
+    #[test]
+    fn skips_default_running_stage_history_noise() {
+        let service = create_task_service();
+
+        service
+            .update_task_status(
+                &UpdateStateRequest {
+                    task_id: "task-noise".to_string(),
+                    status: Some("running".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        let history = service.get_task_stage_history("task-noise");
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn updates_desktop_metadata_from_state_and_progress_requests() {
+        let service = create_task_service();
+
+        service
+            .update_task_status(
+                &UpdateStateRequest {
+                    task_id: "task-meta".to_string(),
+                    status: Some("running".to_string()),
+                    project_path: Some("/tmp/project".to_string()),
+                    active_file: Some("src/main.rs".to_string()),
+                    window_title: Some("main.rs - Cursor".to_string()),
+                    is_focused: Some(true),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        service
+            .update_task_progress(
+                &UpdateProgressRequest {
+                    task_id: "task-meta".to_string(),
+                    active_file: Some("src/lib.rs".to_string()),
+                    window_title: Some("lib.rs - Cursor".to_string()),
+                    is_focused: Some(false),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        let task = service.get_task("task-meta", "user-1").unwrap();
+        assert_eq!(task.project_path.as_deref(), Some("/tmp/project"));
+        assert_eq!(task.active_file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(task.window_title, "lib.rs - Cursor");
+        assert!(!task.is_focused);
     }
 
     #[test]

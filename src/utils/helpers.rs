@@ -46,6 +46,22 @@ pub async fn authenticate_jwt(
     Err(StatusCode::UNAUTHORIZED)
 }
 
+pub async fn authenticate_user(
+    headers: &HeaderMap,
+    state: &Arc<crate::AppState>,
+) -> Result<String, StatusCode> {
+    if let Some(api_key) = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+    {
+        if let Some(user) = state.user_service.find_user_by_api_key(api_key) {
+            return Ok(user.id);
+        }
+    }
+
+    authenticate_jwt(headers, state).await
+}
+
 pub async fn authenticate(
     headers: &HeaderMap,
     api_key: &str,

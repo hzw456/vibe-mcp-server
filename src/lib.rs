@@ -57,6 +57,10 @@ pub fn create_router(state: AppState) -> Router {
         // Task endpoints (require JWT)
         .route("/api/status", get(handlers::get_status))
         .route("/api/history", get(handlers::get_history))
+        .route(
+            "/api/task/:task_id/stages",
+            get(handlers::get_task_stage_history),
+        )
         .route("/api/task/update_state", post(handlers::update_task_state))
         .route(
             "/api/task/update_progress",
