@@ -120,6 +120,17 @@ impl TaskService {
         }
     }
 
+    fn stage_event_for_progress(
+        req: &UpdateProgressRequest,
+        current_stage: Option<&str>,
+        active_file: Option<&str>,
+    ) -> Option<String> {
+        Self::normalized_stage(req.current_stage.as_deref())
+            .or_else(|| Self::normalized_stage(current_stage))
+            .or_else(|| Self::normalized_stage(req.active_file.as_deref()))
+            .or_else(|| Self::normalized_stage(active_file))
+    }
+
     fn should_finalize_stage(status: Option<TaskStatus>) -> bool {
         matches!(
             status,
@@ -697,7 +708,11 @@ impl TaskService {
 
         task.last_heartbeat = now;
 
-        let stage_event = Self::normalized_stage(req.current_stage.as_deref());
+        let stage_event = Self::stage_event_for_progress(
+            req,
+            task.current_stage.as_deref(),
+            task.active_file.as_deref(),
+        );
         let task_clone = task.clone();
         let db_url = self.db_url.clone();
         drop(tasks);
@@ -815,6 +830,69 @@ mod tests {
         assert_eq!(history[1].stage, "Implementing");
         assert!(history[0].ended_at.is_some());
         assert_eq!(history[1].ended_at, None);
+    }
+
+    #[test]
+    fn prefers_explicit_current_stage_over_active_file_in_progress_history() {
+        let service = create_task_service();
+
+        service
+            .update_task_status(
+                &UpdateStateRequest {
+                    task_id: "task-priority".to_string(),
+                    status: Some("running".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        service
+            .update_task_progress(
+                &UpdateProgressRequest {
+                    task_id: "task-priority".to_string(),
+                    current_stage: Some("refactoring code".to_string()),
+                    active_file: Some("rpc_query_nds.cc".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        let history = service.get_task_stage_history("task-priority");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].stage, "refactoring code");
+    }
+
+    #[test]
+    fn falls_back_to_active_file_for_progress_history_when_stage_missing() {
+        let service = create_task_service();
+
+        service
+            .update_task_status(
+                &UpdateStateRequest {
+                    task_id: "task-file-fallback".to_string(),
+                    status: Some("running".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        service
+            .update_task_progress(
+                &UpdateProgressRequest {
+                    task_id: "task-file-fallback".to_string(),
+                    active_file: Some("src/lib.rs".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        let history = service.get_task_stage_history("task-file-fallback");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].stage, "src/lib.rs");
     }
 
     #[test]
