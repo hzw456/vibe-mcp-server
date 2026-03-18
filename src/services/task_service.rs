@@ -144,9 +144,7 @@ impl TaskService {
         active_file: Option<&str>,
     ) -> Option<StageEvent> {
         let stage = Self::normalized_stage(req.active_file.as_deref())
-            .or_else(|| Self::normalized_stage(active_file))
-            .or_else(|| Self::normalized_stage(req.current_stage.as_deref()))
-            .or_else(|| Self::normalized_stage(current_stage))?;
+            .or_else(|| Self::normalized_stage(active_file))?;
         let description = Self::normalized_description(req.current_stage.as_deref())
             .or_else(|| Self::normalized_description(current_stage));
 
@@ -926,6 +924,36 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].stage, "src/lib.rs");
         assert_eq!(history[0].description, None);
+    }
+
+    #[test]
+    fn does_not_use_current_stage_as_progress_stage_without_active_file() {
+        let service = create_task_service();
+
+        service
+            .update_task_status(
+                &UpdateStateRequest {
+                    task_id: "task-no-file".to_string(),
+                    status: Some("running".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        service
+            .update_task_progress(
+                &UpdateProgressRequest {
+                    task_id: "task-no-file".to_string(),
+                    current_stage: Some("refactoring code".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        let history = service.get_task_stage_history("task-no-file");
+        assert!(history.is_empty());
     }
 
     #[test]
