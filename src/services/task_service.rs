@@ -158,6 +158,64 @@ impl TaskService {
         )
     }
 
+    fn fallback_created_at(task: &Task, now: i64) -> i64 {
+        [task.start_time, task.last_heartbeat, now]
+            .into_iter()
+            .find(|timestamp| *timestamp > 0)
+            .unwrap_or(now)
+    }
+
+    fn sort_timestamp(task: &Task) -> i64 {
+        [task.start_time, task.last_heartbeat, task.created_at]
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn normalize_task(task: &mut Task, now: i64) {
+        if task.created_at <= 0 {
+            task.created_at = Self::fallback_created_at(task, now);
+        }
+
+        if task.start_time <= 0 && !matches!(task.status, TaskStatus::Armed) {
+            task.start_time = task.created_at;
+        }
+
+        if let Some(end_time) = task.end_time {
+            let normalized_end_time = if task.start_time > 0 {
+                end_time.max(task.start_time)
+            } else {
+                end_time.max(task.created_at)
+            };
+            task.end_time = Some(normalized_end_time);
+
+            if matches!(task.status, TaskStatus::Armed | TaskStatus::Running) {
+                task.status = TaskStatus::Completed;
+            }
+        }
+
+        if matches!(
+            task.status,
+            TaskStatus::Completed | TaskStatus::Error | TaskStatus::Cancelled
+        ) && task.end_time.is_none()
+        {
+            task.end_time = Some(
+                [task.last_heartbeat, task.start_time, task.created_at, now]
+                    .into_iter()
+                    .max()
+                    .unwrap_or(now),
+            );
+        }
+
+        if task.last_heartbeat <= 0 {
+            task.last_heartbeat = task
+                .end_time
+                .unwrap_or_else(|| Self::sort_timestamp(task).max(task.created_at));
+        } else if let Some(end_time) = task.end_time {
+            task.last_heartbeat = task.last_heartbeat.max(end_time);
+        }
+    }
+
     fn record_stage_history_in_memory(
         &self,
         task_id: &str,
@@ -234,7 +292,7 @@ impl TaskService {
             let status_str = format!("{:?}", task.status).to_lowercase();
             if let Ok(mut tx) = pool.begin().await {
                 let task_query = sqlx::query(
-                    "INSERT INTO vibe_tasks (id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage, ide, window_title, project_path, active_file, is_focused) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), name = VALUES(name), status = VALUES(status), source = VALUES(source), start_time = VALUES(start_time), end_time = VALUES(end_time), last_heartbeat = VALUES(last_heartbeat), estimated_duration_ms = VALUES(estimated_duration_ms), current_stage = VALUES(current_stage), ide = VALUES(ide), window_title = VALUES(window_title), project_path = VALUES(project_path), active_file = VALUES(active_file), is_focused = VALUES(is_focused)"
+                    "INSERT INTO vibe_tasks (id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage, ide, window_title, project_path, active_file, is_focused, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), name = VALUES(name), status = VALUES(status), source = VALUES(source), start_time = VALUES(start_time), end_time = VALUES(end_time), last_heartbeat = VALUES(last_heartbeat), estimated_duration_ms = VALUES(estimated_duration_ms), current_stage = VALUES(current_stage), ide = VALUES(ide), window_title = VALUES(window_title), project_path = VALUES(project_path), active_file = VALUES(active_file), is_focused = VALUES(is_focused)"
                 )
                 .bind(&task.id)
                 .bind(&task.user_id)
@@ -251,6 +309,7 @@ impl TaskService {
                 .bind(&task.project_path)
                 .bind(&task.active_file)
                 .bind(task.is_focused)
+                .bind(task.created_at)
                 .execute(&mut *tx)
                 .await;
 
@@ -325,7 +384,7 @@ impl TaskService {
                 };
 
                 let rows = match sqlx::query(
-                    "SELECT id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage, ide, window_title, project_path, active_file, is_focused FROM vibe_tasks"
+                    "SELECT id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage, ide, window_title, project_path, active_file, is_focused, created_at FROM vibe_tasks"
                 )
                 .fetch_all(&pool)
                 .await
@@ -353,10 +412,15 @@ impl TaskService {
                         }
                     };
 
-                    let task = Task {
+                    let mut task = Task {
                         id: id.clone(),
                         user_id: row.try_get("user_id").unwrap_or_default(),
                         name: row.try_get("name").unwrap_or_else(|_| id.clone()),
+                        created_at: row
+                            .try_get::<Option<i64>, _>("created_at")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0),
                         is_focused: row.try_get("is_focused").unwrap_or(false),
                         ide: row.try_get("ide").unwrap_or_else(|_| "IDE".to_string()),
                         window_title: row.try_get("window_title").unwrap_or_else(|_| id.clone()),
@@ -377,6 +441,7 @@ impl TaskService {
                             .flatten(),
                         current_stage: row.try_get("current_stage").ok(),
                     };
+                    Self::normalize_task(&mut task, now_millis());
 
                     tasks.insert(id, task);
                 }
@@ -561,7 +626,12 @@ impl TaskService {
         } else {
             tasks.values().cloned().collect()
         };
-        tasks_vec.sort_by(|a, b| b.id.cmp(&a.id));
+        tasks_vec.sort_by(|a, b| {
+            Self::sort_timestamp(b)
+                .cmp(&Self::sort_timestamp(a))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id))
+        });
         tasks_vec
     }
 
@@ -655,6 +725,7 @@ impl TaskService {
         }
 
         task.last_heartbeat = now;
+        Self::normalize_task(task, now);
 
         let stage_event =
             Self::stage_event_for_state(req, history_status, task.current_stage.as_deref());
@@ -734,6 +805,7 @@ impl TaskService {
         }
 
         task.last_heartbeat = now;
+        Self::normalize_task(task, now);
 
         let stage_event = Self::stage_event_for_progress(
             req,
@@ -1101,5 +1173,82 @@ mod tests {
         assert_eq!(history[1].description, None);
         assert_eq!(history[1].ended_at, Some(1_710_000_000_000));
         assert_eq!(history[1].duration, Some(0));
+    }
+
+    #[test]
+    fn sorts_tasks_by_recent_activity_instead_of_id() {
+        let service = create_task_service();
+
+        service
+            .update_task_status(
+                &UpdateStateRequest {
+                    task_id: "b-task".to_string(),
+                    status: Some("running".to_string()),
+                    start_time: Some(100),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        service
+            .update_task_status(
+                &UpdateStateRequest {
+                    task_id: "a-task".to_string(),
+                    status: Some("running".to_string()),
+                    start_time: Some(200),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        let tasks = service.get_tasks(Some("user-1"));
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "a-task");
+        assert_eq!(tasks[1].id, "b-task");
+    }
+
+    #[test]
+    fn coerces_in_progress_status_to_completed_when_end_time_exists() {
+        let service = create_task_service();
+
+        service
+            .update_task_status(
+                &UpdateStateRequest {
+                    task_id: "task-ended".to_string(),
+                    status: Some("running".to_string()),
+                    start_time: Some(100),
+                    end_time: Some(200),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        let task = service.get_task("task-ended", "user-1").unwrap();
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.start_time, 100);
+        assert_eq!(task.end_time, Some(200));
+    }
+
+    #[test]
+    fn backfills_created_at_for_new_tasks() {
+        let service = create_task_service();
+
+        service
+            .update_task_status(
+                &UpdateStateRequest {
+                    task_id: "task-created".to_string(),
+                    status: Some("running".to_string()),
+                    ..Default::default()
+                },
+                "user-1",
+            )
+            .unwrap();
+
+        let task = service.get_task("task-created", "user-1").unwrap();
+        assert!(task.created_at > 0);
+        assert!(task.start_time >= task.created_at);
     }
 }
