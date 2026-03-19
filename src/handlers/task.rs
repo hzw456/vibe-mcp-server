@@ -1,4 +1,3 @@
-use crate::models::TaskStatus;
 use crate::services::task_service::{TaskServiceError, UpdateProgressRequest, UpdateStateRequest};
 use crate::utils::helpers::{authenticate_user, now_millis, validate_status};
 use crate::AppState;
@@ -53,8 +52,14 @@ pub async fn get_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
-    let user_id = crate::utils::helpers::authenticate_jwt(&headers, &state).await?;
-    let tasks = state.task_service.get_tasks(Some(&user_id));
+    let user_id = crate::utils::helpers::authenticate_user(&headers, &state).await?;
+    // When using API key auth, user_id is "api_key_user" which doesn't match DB users
+    // So we get all tasks without filtering
+    let tasks = if user_id == "api_key_user" {
+        state.task_service.get_tasks(None)
+    } else {
+        state.task_service.get_tasks(Some(&user_id))
+    };
     Ok(Json(json!({ "tasks": tasks, "taskCount": tasks.len() })))
 }
 
@@ -62,13 +67,15 @@ pub async fn get_history(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
-    let user_id = crate::utils::helpers::authenticate_jwt(&headers, &state).await?;
-    let tasks: Vec<_> = state
-        .task_service
-        .get_tasks(Some(&user_id))
-        .into_iter()
-        .filter(|task| task.status == TaskStatus::Completed)
-        .collect();
+    let user_id = crate::utils::helpers::authenticate_user(&headers, &state).await?;
+    // When using API key auth, user_id is "api_key_user" which doesn't match DB users
+    // So we get all tasks without filtering
+    let tasks = if user_id == "api_key_user" {
+        state.task_service.get_tasks(None)
+    } else {
+        state.task_service.get_tasks(Some(&user_id))
+    };
+    // Filter to return all statuses for history viewing
     Ok(Json(json!({ "tasks": tasks, "taskCount": tasks.len() })))
 }
 

@@ -54,6 +54,11 @@ pub async fn authenticate_user(
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
     {
+        // First check against server's main API key
+        if api_key == state.config.api_key {
+            return Ok("api_key_user".to_string());
+        }
+        // Then check for per-user API keys
         if let Some(user) = state.user_service.find_user_by_api_key(api_key) {
             return Ok(user.id);
         }
