@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 pub struct RegisterRequest {
     pub email: String,
     pub password: String,
+    pub password_confirm: String,
 }
 
 #[derive(Debug, Deserialize)]

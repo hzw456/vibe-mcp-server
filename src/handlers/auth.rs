@@ -33,21 +33,19 @@ pub async fn register(
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     if !crate::utils::helpers::validate_email(&req.email) {
-        return Ok(Json(
-            json!({ "success": false, "error": "Invalid email format" }),
-        ));
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     if req.password.len() < 6 {
-        return Ok(Json(
-            json!({ "success": false, "error": "Password must be at least 6 characters" }),
-        ));
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    if req.password != req.password_confirm {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     if state.user_service.find_user_by_email(&req.email).is_some() {
-        return Ok(Json(
-            json!({ "success": false, "error": "Email already registered" }),
-        ));
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let password_hash =
