@@ -1,6 +1,5 @@
 use crate::models::{Task, TaskStageHistory, TaskStatus};
 use crate::utils::helpers::{now_millis, validate_status};
-use chrono::Utc;
 use serde::Deserialize;
 use sqlx::{
     mysql::{MySqlPoolOptions, MySqlRow},
@@ -500,6 +499,7 @@ impl TaskService {
         stage_finalize_at: Option<i64>,
     ) {
         let db_url = self.db_url.clone();
+        tracing::info!("spawning persist thread for task_id={}", task.id);
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -525,7 +525,7 @@ impl TaskService {
         })
         .join()
         .unwrap_or_else(|_| {
-            tracing::warn!("Task persist thread panicked");
+            tracing::error!("persist_task_and_stage_history_blocking: thread PANICKED for task");
         });
     }
 
@@ -536,76 +536,397 @@ impl TaskService {
         stage_started_at: i64,
         stage_finalize_at: Option<i64>,
     ) {
-        let pool = MySqlPoolOptions::new()
+        let stage_name = stage_event
+            .as_ref()
+            .map(|event| event.stage.as_str())
+            .unwrap_or("<none>")
+            .to_string();
+        let pool = match MySqlPoolOptions::new()
             .max_connections(1)
             .connect(&db_url)
-            .await;
-        if let Ok(pool) = pool {
-            let status_str = format!("{:?}", task.status).to_lowercase();
-            if let Ok(mut tx) = pool.begin().await {
-                let task_query = sqlx::query(
-                    "INSERT INTO vibe_tasks (id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage, ide, window_title, project_path, active_file, is_focused, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), name = VALUES(name), status = VALUES(status), source = VALUES(source), start_time = VALUES(start_time), end_time = VALUES(end_time), last_heartbeat = VALUES(last_heartbeat), estimated_duration_ms = VALUES(estimated_duration_ms), current_stage = VALUES(current_stage), ide = VALUES(ide), window_title = VALUES(window_title), project_path = VALUES(project_path), active_file = VALUES(active_file), is_focused = VALUES(is_focused)"
+            .await
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                tracing::error!(
+                    task_id = %task.id,
+                    user_id = %task.user_id,
+                    status = ?task.status,
+                    stage = %stage_name,
+                    "persist: pool.connect() FAILED: {}",
+                    error
+                );
+                return;
+            }
+        };
+
+        if let Err(error) = Self::ensure_task_stage_history_schema(&pool).await {
+            tracing::error!(
+                task_id = %task.id,
+                user_id = %task.user_id,
+                status = ?task.status,
+                stage = %stage_name,
+                "persist: ensure vibe_task_stages schema FAILED: {}",
+                error
+            );
+            return;
+        }
+
+        let status_str = format!("{:?}", task.status).to_lowercase();
+        tracing::info!(
+            task_id = %task.id,
+            user_id = %task.user_id,
+            status = %status_str,
+            stage = %stage_name,
+            stage_started_at,
+            stage_finalize_at = ?stage_finalize_at,
+            stage_event = ?stage_event,
+            "persist_task_and_stage_history: begin"
+        );
+
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                tracing::error!(
+                    task_id = %task.id,
+                    user_id = %task.user_id,
+                    status = %status_str,
+                    stage = %stage_name,
+                    "persist: pool.begin() FAILED: {}",
+                    error
+                );
+                return;
+            }
+        };
+
+        let created_at = match chrono::DateTime::from_timestamp_millis(task.created_at) {
+            Some(timestamp) => timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+            None => {
+                tracing::error!(
+                    task_id = %task.id,
+                    user_id = %task.user_id,
+                    status = %status_str,
+                    stage = %stage_name,
+                    created_at = task.created_at,
+                    "persist: invalid task.created_at"
+                );
+                Self::rollback_task_persist(
+                    tx,
+                    &task.id,
+                    &task.user_id,
+                    &status_str,
+                    &stage_name,
+                    "invalid_created_at",
                 )
-                .bind(&task.id)
-                .bind(&task.user_id)
-                .bind(&task.name)
-                .bind(&status_str)
-                .bind(&task.source)
-                .bind(task.start_time)
-                .bind(task.end_time)
-                .bind(task.last_heartbeat)
-                .bind(task.estimated_duration)
-                .bind(&task.current_stage)
-                .bind(&task.ide)
-                .bind(&task.window_title)
-                .bind(&task.project_path)
-                .bind(&task.active_file)
-                .bind(task.is_focused)
-                .bind(chrono::DateTime::from_timestamp_millis(task.created_at).unwrap().format("%Y-%m-%d %H:%M:%S").to_string())  // Format for MySQL TIMESTAMP
-                .execute(&mut *tx)
                 .await;
+                return;
+            }
+        };
 
-                if task_query.is_err() {
-                    let _ = tx.rollback().await;
-                    return;
-                }
+        let task_query = sqlx::query(
+            "INSERT INTO vibe_tasks (id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage, ide, window_title, project_path, active_file, is_focused, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), name = VALUES(name), status = VALUES(status), source = VALUES(source), start_time = VALUES(start_time), end_time = VALUES(end_time), last_heartbeat = VALUES(last_heartbeat), estimated_duration_ms = VALUES(estimated_duration_ms), current_stage = VALUES(current_stage), ide = VALUES(ide), window_title = VALUES(window_title), project_path = VALUES(project_path), active_file = VALUES(active_file), is_focused = VALUES(is_focused)"
+        )
+        .bind(&task.id)
+        .bind(&task.user_id)
+        .bind(&task.name)
+        .bind(&status_str)
+        .bind(&task.source)
+        .bind(task.start_time)
+        .bind(task.end_time)
+        .bind(task.last_heartbeat)
+        .bind(task.estimated_duration)
+        .bind(&task.current_stage)
+        .bind(&task.ide)
+        .bind(&task.window_title)
+        .bind(&task.project_path)
+        .bind(&task.active_file)
+        .bind(task.is_focused)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await;
 
-                if let Some(stage_event) = stage_event {
-                    let close_previous = sqlx::query(
-                        "UPDATE vibe_task_stages SET ended_at = ?, duration = GREATEST(? - started_at, 0) WHERE task_id = ? AND ended_at IS NULL"
-                    )
-                    .bind(stage_started_at)
-                    .bind(stage_started_at)
-                    .bind(&task.id)
-                    .execute(&mut *tx)
-                    .await;
+        if let Err(error) = task_query {
+            tracing::error!(
+                task_id = %task.id,
+                user_id = %task.user_id,
+                status = %status_str,
+                stage = %stage_name,
+                start_time = task.start_time,
+                end_time = ?task.end_time,
+                last_heartbeat = task.last_heartbeat,
+                current_stage = ?task.current_stage,
+                "persist: INSERT vibe_tasks FAILED: {}",
+                error
+            );
+            Self::rollback_task_persist(
+                tx,
+                &task.id,
+                &task.user_id,
+                &status_str,
+                &stage_name,
+                "task_upsert_failed",
+            )
+            .await;
+            return;
+        }
 
-                    if close_previous.is_err() {
-                        let _ = tx.rollback().await;
-                        return;
-                    }
+        if let Some(stage_event) = stage_event {
+            let close_previous = sqlx::query(
+                "UPDATE vibe_task_stages SET ended_at = ?, duration = GREATEST(? - started_at, 0) WHERE task_id = ? AND ended_at IS NULL"
+            )
+            .bind(stage_started_at)
+            .bind(stage_started_at)
+            .bind(&task.id)
+            .execute(&mut *tx)
+            .await;
 
-                    let insert_stage = sqlx::query(
-                        "INSERT INTO vibe_task_stages (task_id, stage, description, started_at, ended_at, duration) VALUES (?, ?, ?, ?, ?, ?)"
-                    )
-                    .bind(&task.id)
-                    .bind(&stage_event.stage)
-                    .bind(&stage_event.description)
-                    .bind(stage_started_at)
-                    .bind(stage_finalize_at)
-                    .bind(stage_finalize_at.map(|ended_at| (ended_at - stage_started_at).max(0)))
-                    .execute(&mut *tx)
-                    .await;
+            if let Err(error) = close_previous {
+                tracing::error!(
+                    task_id = %task.id,
+                    user_id = %task.user_id,
+                    status = %status_str,
+                    stage = %stage_event.stage,
+                    stage_started_at,
+                    "persist: UPDATE vibe_task_stages close_previous FAILED: {}",
+                    error
+                );
+                Self::rollback_task_persist(
+                    tx,
+                    &task.id,
+                    &task.user_id,
+                    &status_str,
+                    &stage_event.stage,
+                    "close_previous_stage_failed",
+                )
+                .await;
+                return;
+            }
 
-                    if insert_stage.is_err() {
-                        let _ = tx.rollback().await;
-                        return;
-                    }
-                }
+            let stage_duration =
+                stage_finalize_at.map(|ended_at| (ended_at - stage_started_at).max(0));
+            let insert_stage = sqlx::query(
+                "INSERT INTO vibe_task_stages (task_id, stage, description, started_at, ended_at, duration) VALUES (?, ?, ?, ?, ?, ?)"
+            )
+            .bind(&task.id)
+            .bind(&stage_event.stage)
+            .bind(&stage_event.description)
+            .bind(stage_started_at)
+            .bind(stage_finalize_at)
+            .bind(stage_duration)
+            .execute(&mut *tx)
+            .await;
 
-                let _ = tx.commit().await;
+            if let Err(error) = insert_stage {
+                tracing::error!(
+                    task_id = %task.id,
+                    user_id = %task.user_id,
+                    status = %status_str,
+                    stage = %stage_event.stage,
+                    description = ?stage_event.description,
+                    stage_started_at,
+                    stage_finalize_at = ?stage_finalize_at,
+                    stage_duration = ?stage_duration,
+                    "persist: INSERT vibe_task_stages FAILED: {}",
+                    error
+                );
+                Self::rollback_task_persist(
+                    tx,
+                    &task.id,
+                    &task.user_id,
+                    &status_str,
+                    &stage_event.stage,
+                    "insert_stage_history_failed",
+                )
+                .await;
+                return;
             }
         }
+
+        if let Err(error) = tx.commit().await {
+            tracing::error!(
+                task_id = %task.id,
+                user_id = %task.user_id,
+                status = %status_str,
+                stage = %stage_name,
+                "persist: COMMIT FAILED: {}",
+                error
+            );
+        } else {
+            tracing::info!(
+                task_id = %task.id,
+                user_id = %task.user_id,
+                status = %status_str,
+                stage = %stage_name,
+                "persist: COMMIT OK"
+            );
+        }
+    }
+
+    async fn rollback_task_persist(
+        tx: sqlx::Transaction<'_, MySql>,
+        task_id: &str,
+        user_id: &str,
+        status: &str,
+        stage: &str,
+        reason: &str,
+    ) {
+        if let Err(error) = tx.rollback().await {
+            tracing::error!(
+                task_id,
+                user_id,
+                status,
+                stage,
+                reason,
+                "persist: ROLLBACK FAILED: {}",
+                error
+            );
+        } else {
+            tracing::warn!(
+                task_id,
+                user_id,
+                status,
+                stage,
+                reason,
+                "persist: transaction rolled back"
+            );
+        }
+    }
+
+    async fn ensure_task_stage_history_schema(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
+        // First, check what columns the table actually has
+        let column_names: Vec<String> = sqlx::query_scalar(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vibe_task_stages'"
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        let has_stage = column_names.iter().any(|c| c == "stage");
+        let has_description_col = column_names.iter().any(|c| c == "description");
+
+        if column_names.is_empty() {
+            // Table doesn't exist - create it
+            // NOTE: vibe_tasks.id is VARCHAR(64) with utf8mb4_0900_ai_ci, so task_id must match
+            tracing::info!("persist: vibe_task_stages table doesn't exist, creating");
+            sqlx::query(
+                "CREATE TABLE vibe_task_stages (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    task_id VARCHAR(64) NOT NULL CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci,
+                    stage TEXT NOT NULL,
+                    description TEXT NULL,
+                    started_at BIGINT NOT NULL,
+                    ended_at BIGINT NULL,
+                    duration BIGINT NULL,
+                    created_at BIGINT NOT NULL DEFAULT (UNIX_TIMESTAMP() * 1000),
+                    updated_at BIGINT NOT NULL DEFAULT (UNIX_TIMESTAMP() * 1000),
+                    FOREIGN KEY (task_id) REFERENCES vibe_tasks(id) ON DELETE CASCADE,
+                    INDEX idx_task_stage_task_id (task_id),
+                    INDEX idx_task_stage_started_at (started_at),
+                    INDEX idx_task_stage_ended_at (ended_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+            )
+            .execute(pool)
+            .await?;
+        } else if !has_stage {
+            // Legacy schema with stage_name instead of stage - need full rebuild
+            tracing::warn!(
+                ?column_names,
+                "persist: detected legacy vibe_task_stages schema (has stage_name, not stage). Dropping and rebuilding."
+            );
+            sqlx::query("SET FOREIGN_KEY_CHECKS = 0")
+                .execute(pool)
+                .await
+                .ok();
+            sqlx::query("DROP TABLE IF EXISTS vibe_task_stages")
+                .execute(pool)
+                .await
+                .ok();
+            sqlx::query("SET FOREIGN_KEY_CHECKS = 1")
+                .execute(pool)
+                .await
+                .ok();
+            sqlx::query(
+                "CREATE TABLE vibe_task_stages (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    task_id VARCHAR(64) NOT NULL CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci,
+                    stage TEXT NOT NULL,
+                    description TEXT NULL,
+                    started_at BIGINT NOT NULL,
+                    ended_at BIGINT NULL,
+                    duration BIGINT NULL,
+                    created_at BIGINT NOT NULL DEFAULT (UNIX_TIMESTAMP() * 1000),
+                    updated_at BIGINT NOT NULL DEFAULT (UNIX_TIMESTAMP() * 1000),
+                    FOREIGN KEY (task_id) REFERENCES vibe_tasks(id) ON DELETE CASCADE,
+                    INDEX idx_task_stage_task_id (task_id),
+                    INDEX idx_task_stage_started_at (started_at),
+                    INDEX idx_task_stage_ended_at (ended_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+            )
+            .execute(pool)
+            .await?;
+            tracing::info!("persist: legacy vibe_task_stages dropped and new schema created");
+        } else if !has_description_col {
+            sqlx::query(
+                "ALTER TABLE vibe_task_stages ADD COLUMN description TEXT NULL AFTER stage",
+            )
+            .execute(pool)
+            .await
+            .ok();
+        }
+
+        // Fix task_id column width/collation if it doesn't match vibe_tasks.id (VARCHAR(64) utf8mb4_0900_ai_ci)
+        // and add the FK constraint if missing. This handles tables created with wrong schema.
+        let task_id_col_info: Option<String> = sqlx::query_scalar(
+            "SELECT CONCAT(COLUMN_TYPE, '|', IFNULL(COLLATION_NAME, '')) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vibe_task_stages' AND COLUMN_NAME = 'task_id'"
+        )
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .and_then(|r| r);
+
+        let needs_task_id_fix = task_id_col_info.as_ref().map(|col_info| {
+            let (col_type, collation) = col_info.split_once('|').map(|(t, c)| (t, c)).unwrap_or((col_info.as_str(), ""));
+            col_type.to_lowercase() != "varchar(64)" || collation != "utf8mb4_0900_ai_ci"
+        }).unwrap_or(false);
+
+        if needs_task_id_fix {
+            let col_info = task_id_col_info.as_ref().map(|s| s.clone()).unwrap_or_default();
+            let (col_type, collation) = col_info.split_once('|').map(|(t, c)| (t, c)).unwrap_or((col_info.as_str(), ""));
+            tracing::warn!(
+                "persist: vibe_task_stages.task_id has wrong type/collation ('{}'/'{}'), fixing to VARCHAR(64)/utf8mb4_0900_ai_ci",
+                col_type, collation
+            );
+            sqlx::query("SET FOREIGN_KEY_CHECKS = 0")
+                .execute(pool)
+                .await
+                .ok();
+            sqlx::query("ALTER TABLE vibe_task_stages MODIFY COLUMN task_id VARCHAR(64) NOT NULL CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci")
+                .execute(pool)
+                .await
+                .ok();
+            sqlx::query("SET FOREIGN_KEY_CHECKS = 1")
+                .execute(pool)
+                .await
+                .ok();
+        }
+
+        // Add FK constraint if it doesn't exist
+        let fk_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vibe_task_stages' AND CONSTRAINT_TYPE = 'FOREIGN KEY'"
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+        if fk_exists == 0 {
+            tracing::info!("persist: adding missing FK constraint to vibe_task_stages");
+            sqlx::query("ALTER TABLE vibe_task_stages ADD CONSTRAINT FOREIGN KEY (task_id) REFERENCES vibe_tasks(id) ON DELETE CASCADE")
+                .execute(pool)
+                .await
+                .ok();
+        }
+
+        Ok(())
     }
 
     fn load_stage_history_from_db(db_url: &str, task_id: &str) -> Vec<TaskStageHistory> {

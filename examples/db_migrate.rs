@@ -82,6 +82,32 @@ fn main() {
     }
     println!("✅ vibe_tasks table created successfully!");
 
+    // Create vibe_task_stages table
+    println!("Creating vibe_task_stages table...");
+    if let Err(e) = conn.query_drop(
+        r#"
+        CREATE TABLE IF NOT EXISTS vibe_task_stages (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            task_id VARCHAR(36) NOT NULL,
+            stage TEXT NOT NULL,
+            description TEXT NULL,
+            started_at BIGINT NOT NULL,
+            ended_at BIGINT NULL,
+            duration BIGINT NULL,
+            created_at BIGINT NOT NULL DEFAULT (UNIX_TIMESTAMP() * 1000),
+            updated_at BIGINT NOT NULL DEFAULT (UNIX_TIMESTAMP() * 1000),
+            FOREIGN KEY (task_id) REFERENCES vibe_tasks(id) ON DELETE CASCADE,
+            INDEX idx_task_stage_task_id (task_id),
+            INDEX idx_task_stage_started_at (started_at),
+            INDEX idx_task_stage_ended_at (ended_at)
+        )
+    "#,
+    ) {
+        eprintln!("❌ Failed to create vibe_task_stages table: {}", e);
+        process::exit(1);
+    }
+    println!("✅ vibe_task_stages table created successfully!");
+
     // Create vibe_verification_codes table
     println!("Creating vibe_verification_codes table...");
     if let Err(e) = conn.query_drop(

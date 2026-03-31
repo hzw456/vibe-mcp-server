@@ -210,17 +210,23 @@ pub async fn mcp_handler(
     headers: HeaderMap,
     ApiJson(req): ApiJson<serde_json::Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    // Authenticate: try API key first, then JWT
+    // Authenticate: try server API key first, then user API key, then JWT
     let user_id = {
         if let Some(api_key) = headers
             .get("x-api-key")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
         {
-            state
-                .user_service
-                .find_user_by_api_key(&api_key)
-                .map(|user| user.id)
+            // First check if it's the server's main API key
+            if api_key == state.config.api_key {
+                Some("api_key_user".to_string())
+            } else {
+                // Otherwise try user API key from database
+                state
+                    .user_service
+                    .find_user_by_api_key(&api_key)
+                    .map(|user| user.id)
+            }
         } else {
             // Try JWT
             crate::utils::helpers::authenticate_jwt(&headers, &state)
