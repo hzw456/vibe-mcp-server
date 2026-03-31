@@ -2,7 +2,7 @@ use crate::services::auth_service::AuthService;
 use crate::services::user_service::{
     LoginRequest, RegisterRequest, SendVerificationRequest, VerifyCodeRequest,
 };
-use crate::AppState;
+use crate::{ApiJson, AppState};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -30,7 +30,7 @@ pub async fn refresh_api_key(
 
 pub async fn register(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<RegisterRequest>,
+    ApiJson(req): ApiJson<RegisterRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     if !crate::utils::helpers::validate_email(&req.email) {
         return Err(StatusCode::BAD_REQUEST);
@@ -62,7 +62,7 @@ pub async fn register(
 
 pub async fn login(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<LoginRequest>,
+    ApiJson(req): ApiJson<LoginRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     let user = state
         .user_service
@@ -93,7 +93,7 @@ pub async fn login(
 
 pub async fn send_verification(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<SendVerificationRequest>,
+    ApiJson(req): ApiJson<SendVerificationRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     if !crate::utils::helpers::validate_email(&req.email) {
         return Ok(Json(
@@ -121,7 +121,7 @@ pub async fn send_verification(
 
 pub async fn verify_code(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<VerifyCodeRequest>,
+    ApiJson(req): ApiJson<VerifyCodeRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     if !crate::utils::helpers::validate_email(&req.email) {
         return Ok(Json(

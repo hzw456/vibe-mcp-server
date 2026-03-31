@@ -9,8 +9,12 @@ pub use models::{Claims, Task, TaskStageHistory, TaskStatus, User, VerificationC
 pub use services::{AuthService, TaskService, UserService};
 
 use axum::{
+    async_trait,
+    extract::rejection::JsonRejection,
+    extract::{FromRequest, Request},
+    http::StatusCode,
     routing::{get, post},
-    Router,
+    Json, RequestExt, Router,
 };
 use sqlx::mysql::MySqlPoolOptions;
 use std::sync::Arc;
@@ -24,9 +28,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn new(
-        config: Config,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn new(config: Config) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let db_url = config.database_url.clone();
         if !db_url.is_empty() {
             let db_url_for_probe = db_url.clone();
@@ -46,7 +48,9 @@ impl AppState {
                 }
             });
         } else {
-            tracing::warn!("DATABASE_URL is not set; health checks will work, database-backed APIs will not");
+            tracing::warn!(
+                "DATABASE_URL is not set; health checks will work, database-backed APIs will not"
+            );
         }
 
         let task_service = TaskService::new(db_url.clone());
@@ -57,6 +61,33 @@ impl AppState {
             task_service,
             user_service,
         })
+    }
+}
+
+pub struct ApiJson<T>(pub T);
+
+#[async_trait]
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    Json<T>: FromRequest<(), Rejection = JsonRejection>,
+    T: 'static,
+{
+    type Rejection = (StatusCode, String);
+
+    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        match req.extract::<Json<T>, _>().await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => {
+                let status = if rejection.status() == StatusCode::UNPROCESSABLE_ENTITY {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    rejection.status()
+                };
+
+                Err((status, rejection.body_text()))
+            }
+        }
     }
 }
 

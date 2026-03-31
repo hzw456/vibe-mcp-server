@@ -61,8 +61,7 @@ impl Default for Config {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(3010),
-            api_key: std::env::var("API_KEY")
-                .unwrap_or_else(|_| "vibe-mcp-secret-key".to_string()),
+            api_key: std::env::var("API_KEY").unwrap_or_else(|_| "vibe-mcp-secret-key".to_string()),
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "vibe-jwt-secret-key-change-in-production".to_string()),
             jwt_expiry_hours: std::env::var("JWT_EXPIRY_HOURS")

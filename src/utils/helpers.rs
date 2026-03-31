@@ -57,7 +57,10 @@ pub async fn authenticate_user(
         // First check against server's main API key - use a default real user for internal calls
         if api_key == state.config.api_key {
             // Find the first user to use as default for internal API calls
-            if let Some(user) = state.user_service.find_user_by_api_key(&state.config.api_key) {
+            if let Some(user) = state
+                .user_service
+                .find_user_by_api_key(&state.config.api_key)
+            {
                 return Ok(user.id);
             }
             // Fallback: use test user

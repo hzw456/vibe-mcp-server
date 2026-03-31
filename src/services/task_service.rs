@@ -2,7 +2,10 @@ use crate::models::{Task, TaskStageHistory, TaskStatus};
 use crate::utils::helpers::{now_millis, validate_status};
 use chrono::Utc;
 use serde::Deserialize;
-use sqlx::{mysql::{MySqlPoolOptions, MySqlRow}, MySql, Pool, Row};
+use sqlx::{
+    mysql::{MySqlPoolOptions, MySqlRow},
+    MySql, Pool, Row,
+};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -331,11 +334,7 @@ impl TaskService {
         });
     }
 
-    fn query_tasks_from_db(
-        db_url: &str,
-        user_id: Option<&str>,
-        history_only: bool,
-    ) -> Vec<Task> {
+    fn query_tasks_from_db(db_url: &str, user_id: Option<&str>, history_only: bool) -> Vec<Task> {
         let db_url = db_url.to_string();
         let user_id = user_id.map(ToOwned::to_owned);
 
@@ -728,13 +727,23 @@ impl TaskService {
             tasks
                 .values()
                 .filter(|t| &t.user_id == uid)
-                .filter(|t| matches!(t.status, TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::Error))
+                .filter(|t| {
+                    matches!(
+                        t.status,
+                        TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::Error
+                    )
+                })
                 .cloned()
                 .collect()
         } else {
             tasks
                 .values()
-                .filter(|t| matches!(t.status, TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::Error))
+                .filter(|t| {
+                    matches!(
+                        t.status,
+                        TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::Error
+                    )
+                })
                 .cloned()
                 .collect()
         };
@@ -772,7 +781,9 @@ impl TaskService {
                     user_id.to_string(),
                     req.name.clone().unwrap_or_else(|| req.task_id.clone()),
                     req.ide.clone().unwrap_or_else(|| "IDE".to_string()),
-                    req.window_title.clone().unwrap_or_else(|| req.name.clone().unwrap_or_else(|| req.task_id.clone())),
+                    req.window_title
+                        .clone()
+                        .unwrap_or_else(|| req.name.clone().unwrap_or_else(|| req.task_id.clone())),
                 )
             })
         } else {
@@ -783,7 +794,9 @@ impl TaskService {
                     user_id.to_string(),
                     req.name.clone().unwrap_or_else(|| req.task_id.clone()),
                     req.ide.clone().unwrap_or_else(|| "IDE".to_string()),
-                    req.window_title.clone().unwrap_or_else(|| req.name.clone().unwrap_or_else(|| req.task_id.clone())),
+                    req.window_title
+                        .clone()
+                        .unwrap_or_else(|| req.name.clone().unwrap_or_else(|| req.task_id.clone())),
                 )
             });
             if task.user_id != user_id {
@@ -839,7 +852,10 @@ impl TaskService {
             self.persist_task_and_stage_history_blocking(task, None, now, None);
         } else {
             let task_clone = task.clone();
-            self.tasks.lock().unwrap().insert(task_clone.id.clone(), task_clone.clone());
+            self.tasks
+                .lock()
+                .unwrap()
+                .insert(task_clone.id.clone(), task_clone.clone());
             let db_url = self.db_url.clone();
             if !db_url.is_empty() {
                 tokio::spawn(async move {

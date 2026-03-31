@@ -1,6 +1,8 @@
-use crate::services::task_service::{StartTaskRequest, TaskServiceError, UpdateProgressRequest, UpdateStateRequest};
+use crate::services::task_service::{
+    StartTaskRequest, TaskServiceError, UpdateProgressRequest, UpdateStateRequest,
+};
 use crate::utils::helpers::{authenticate_user, now_millis, validate_status};
-use crate::AppState;
+use crate::{ApiJson, AppState};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -81,7 +83,7 @@ pub async fn get_history(
 pub async fn start_task(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<StartTaskRequest>,
+    ApiJson(req): ApiJson<StartTaskRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     let user_id = authenticate_user(&headers, &state).await?;
     state
@@ -94,7 +96,7 @@ pub async fn start_task(
 pub async fn update_task_state(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<UpdateStateRequest>,
+    ApiJson(req): ApiJson<UpdateStateRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     let user_id = authenticate_user(&headers, &state).await?;
     state
@@ -107,7 +109,7 @@ pub async fn update_task_state(
 pub async fn update_task_progress(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<UpdateProgressRequest>,
+    ApiJson(req): ApiJson<UpdateProgressRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     let user_id = authenticate_user(&headers, &state).await?;
     match state.task_service.update_task_progress(&req, &user_id) {
@@ -128,7 +130,7 @@ pub async fn update_task_progress(
 pub async fn sync_task(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<SyncTaskRequest>,
+    ApiJson(req): ApiJson<SyncTaskRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     // Authenticate via API key
     let api_key = headers
@@ -181,7 +183,7 @@ pub async fn sync_task(
 pub async fn delete_task(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<DeleteTaskRequest>,
+    ApiJson(req): ApiJson<DeleteTaskRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     let user_id = crate::utils::helpers::authenticate_jwt(&headers, &state).await?;
     if state.task_service.delete_task(&req.task_id, &user_id) {
@@ -194,7 +196,7 @@ pub async fn delete_task(
 pub async fn reset_tasks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<ResetRequest>,
+    ApiJson(req): ApiJson<ResetRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     let user_id = crate::utils::helpers::authenticate_jwt(&headers, &state).await?;
     state.task_service.reset_tasks(req.task_id, &user_id);
@@ -206,7 +208,7 @@ pub async fn reset_tasks(
 pub async fn mcp_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<serde_json::Value>,
+    ApiJson(req): ApiJson<serde_json::Value>,
 ) -> Result<Json<Value>, StatusCode> {
     // Authenticate: try API key first, then JWT
     let user_id = {
