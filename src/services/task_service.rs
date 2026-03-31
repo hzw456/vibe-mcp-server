@@ -1078,18 +1078,15 @@ impl TaskService {
             );
         }
 
+        // Use blocking persist to ensure task is saved before returning,
+        // preventing race condition where update_progress reads before persist completes
         if !db_url.is_empty() {
-            let stage_event_clone = stage_event.clone();
-            tokio::spawn(async move {
-                Self::persist_task_and_stage_history(
-                    db_url,
-                    task_clone,
-                    stage_event_clone,
-                    stage_started_at,
-                    stage_finalize_at,
-                )
-                .await;
-            });
+            self.persist_task_and_stage_history_blocking(
+                task_clone,
+                stage_event,
+                stage_started_at,
+                stage_finalize_at,
+            );
         }
 
         Ok(())

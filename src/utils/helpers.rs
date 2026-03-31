@@ -54,16 +54,9 @@ pub async fn authenticate_user(
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
     {
-        // First check against server's main API key - use a default real user for internal calls
+        // First check against server's main API key - use a default user for internal calls
         if api_key == state.config.api_key {
-            // Find the first user to use as default for internal API calls
-            if let Some(user) = state
-                .user_service
-                .find_user_by_api_key(&state.config.api_key)
-            {
-                return Ok(user.id);
-            }
-            // Fallback: use test user
+            // Server API key: use default test user directly without DB lookup
             return Ok("7a774878-03d5-4b9a-976b-20e53e67aff2".to_string());
         }
         // Then check for per-user API keys
