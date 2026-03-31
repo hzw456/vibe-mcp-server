@@ -172,15 +172,91 @@ impl UserService {
 
     pub fn find_user_by_api_key(&self, api_key: &str) -> Option<User> {
         let users = self.users.lock().unwrap();
-        users
+        if let Some(user) = users
             .values()
             .find(|u| u.api_key.as_deref() == Some(api_key))
             .cloned()
+        {
+            return Some(user);
+        }
+        drop(users);
+
+        if self.db_url.is_empty() {
+            return None;
+        }
+
+        Self::find_user_by_api_key_from_db(&self.db_url, api_key)
     }
 
     pub fn find_user_by_id(&self, id: &str) -> Option<User> {
         let users = self.users.lock().unwrap();
         users.get(id).cloned()
+    }
+
+    fn find_user_by_api_key_from_db(db_url: &str, api_key: &str) -> Option<User> {
+        let db_url = db_url.to_string();
+        let api_key = api_key.to_string();
+
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!("Failed to create DB runtime for user API key lookup: {}", error);
+                    return None;
+                }
+            };
+
+            runtime.block_on(async move {
+                let pool = match MySqlPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&db_url)
+                    .await
+                {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        tracing::warn!(
+                            "Failed to connect to database during API key lookup: {}",
+                            error
+                        );
+                        return None;
+                    }
+                };
+
+                match sqlx::query(
+                    "SELECT id, email, password_hash, is_verified, created_at, api_key FROM vibe_users WHERE api_key = ? LIMIT 1",
+                )
+                .bind(&api_key)
+                .fetch_optional(&pool)
+                .await
+                {
+                    Ok(Some(row)) => Some(User {
+                        id: row.try_get("id").unwrap_or_default(),
+                        email: row.try_get("email").unwrap_or_default(),
+                        password_hash: row.try_get("password_hash").unwrap_or_default(),
+                        created_at: row
+                            .try_get::<Option<i64>, _>("created_at")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0),
+                        is_verified: row.try_get("is_verified").unwrap_or(false),
+                        api_key: row.try_get("api_key").ok(),
+                    }),
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::warn!("Failed to load user by API key from database: {}", error);
+                        None
+                    }
+                }
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| {
+            tracing::warn!("User API key lookup thread panicked");
+            None
+        })
     }
 
     pub fn regenerate_api_key(&self, user_id: &str) -> Result<String, ()> {
