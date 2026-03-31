@@ -54,9 +54,14 @@ pub async fn authenticate_user(
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
     {
-        // First check against server's main API key
+        // First check against server's main API key - use a default real user for internal calls
         if api_key == state.config.api_key {
-            return Ok("api_key_user".to_string());
+            // Find the first user to use as default for internal API calls
+            if let Some(user) = state.user_service.find_user_by_api_key(&state.config.api_key) {
+                return Ok(user.id);
+            }
+            // Fallback: use test user
+            return Ok("7a774878-03d5-4b9a-976b-20e53e67aff2".to_string());
         }
         // Then check for per-user API keys
         if let Some(user) = state.user_service.find_user_by_api_key(api_key) {
@@ -87,16 +92,16 @@ pub async fn authenticate(
         }
     }
 
-    // Fallback to API Key
+    // Fallback to API Key - use test user for internal API calls
     if let Some(key) = headers.get("x-api-key") {
         if key.to_str().map_or(false, |s| s == api_key) {
-            return Ok("api_key_user".to_string());
+            return Ok("7a774878-03d5-4b9a-976b-20e53e67aff2".to_string());
         }
     }
     if let Some(auth_header) = headers.get("authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
             if auth_str.starts_with("Bearer ") && &auth_str[7..] == api_key {
-                return Ok("api_key_user".to_string());
+                return Ok("7a774878-03d5-4b9a-976b-20e53e67aff2".to_string());
             }
         }
     }

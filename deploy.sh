@@ -9,6 +9,7 @@ set -e
 SERVER_IP="43.143.135.49"
 SERVER_USER="root"
 SERVER_DIR="/root"
+SERVER_PORT="3011"
 LOCAL_BINARY="/Users/zwhao/clawd/vibe-mcp-server/target/release/vibe-mcp-server"
 SERVER_BINARY="$SERVER_DIR/vibe-mcp-server"
 
@@ -53,20 +54,20 @@ ssh "$SERVER_USER@$SERVER_IP" << EOF
     
     # 启动新进程
     echo "🚀 启动服务..."
-    nohup ./vibe-mcp-server > vibe-server.log 2>&1 &
+    nohup ./vibe-mcp-server --host 0.0.0.0 --port $SERVER_PORT > /tmp/vibe.log 2>&1 &
     
     # 等待启动
     sleep 3
     
     # 验证
-    if curl -s http://localhost:3010/health > /dev/null; then
+    if curl -s http://localhost:$SERVER_PORT/health > /dev/null; then
         echo "✅ 服务启动成功!"
-        curl -s http://localhost:3010/health
+        curl -s http://localhost:$SERVER_PORT/health
         echo ""
     else
         echo "❌ 服务启动失败!"
         echo "日志:"
-        cat vibe-server.log
+        cat /tmp/vibe.log
     fi
 EOF
 
@@ -76,9 +77,9 @@ echo "   部署完成!"
 echo "===================================="
 echo ""
 echo "验证:"
-echo "  curl http://$SERVER_IP:3010/health"
+echo "  curl http://$SERVER_IP:$SERVER_PORT/health"
 echo ""
 echo "API 端点:"
-echo "  POST http://$SERVER_IP:3010/api/auth/register"
-echo "  POST http://$SERVER_IP:3010/api/auth/login"
-echo "  GET  http://$SERVER_IP:3010/api/status"
+echo "  POST http://$SERVER_IP:$SERVER_PORT/api/auth/register"
+echo "  POST http://$SERVER_IP:$SERVER_PORT/api/auth/login"
+echo "  GET  http://$SERVER_IP:$SERVER_PORT/api/status"

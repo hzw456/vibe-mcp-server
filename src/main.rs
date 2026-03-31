@@ -4,12 +4,13 @@
 use vibe_mcp_server::{create_router, Config};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = dotenvy::dotenv();
     env_logger::init();
 
-    let config = Config::default();
-    let state = vibe_mcp_server::AppState::new(config.clone());
+    let config = Config::from_args(std::env::args())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let state = vibe_mcp_server::AppState::new(config.clone()).await?;
     let router = create_router(state);
 
     let addr = format!("{}:{}", config.host, config.port);
@@ -20,10 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔐 Auth:   http://{}:{}/api/auth/login", addr, config.port);
     println!("📋 Tasks:  http://{}:{}/api/status", addr, config.port);
     println!("🔌 MCP:    http://{}:{}/mcp", addr, config.port);
-    if !config.database_url.is_empty() {
-        println!("💾 Database: Connected");
+    if config.database_url.is_empty() {
+        println!("💾 Database: Not configured");
     } else {
-        println!("💾 Database: Not configured (in-memory)");
+        println!("💾 Database: Configured");
     }
     println!("\n📝 Environment variables:");
     println!("   API_KEY={}", config.api_key);

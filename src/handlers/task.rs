@@ -1,4 +1,4 @@
-use crate::services::task_service::{TaskServiceError, UpdateProgressRequest, UpdateStateRequest};
+use crate::services::task_service::{StartTaskRequest, TaskServiceError, UpdateProgressRequest, UpdateStateRequest};
 use crate::utils::helpers::{authenticate_user, now_millis, validate_status};
 use crate::AppState;
 use axum::{
@@ -71,12 +71,24 @@ pub async fn get_history(
     // When using API key auth, user_id is "api_key_user" which doesn't match DB users
     // So we get all tasks without filtering
     let tasks = if user_id == "api_key_user" {
-        state.task_service.get_tasks(None)
+        state.task_service.get_history_tasks(None)
     } else {
-        state.task_service.get_tasks(Some(&user_id))
+        state.task_service.get_history_tasks(Some(&user_id))
     };
-    // Filter to return all statuses for history viewing
     Ok(Json(json!({ "tasks": tasks, "taskCount": tasks.len() })))
+}
+
+pub async fn start_task(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<StartTaskRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    let user_id = authenticate_user(&headers, &state).await?;
+    state
+        .task_service
+        .start_task(&req, &user_id)
+        .map_err(task_service_status)?;
+    Ok(Json(json!({"status": "ok"})))
 }
 
 pub async fn update_task_state(
@@ -98,10 +110,18 @@ pub async fn update_task_progress(
     Json(req): Json<UpdateProgressRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     let user_id = authenticate_user(&headers, &state).await?;
-    state
-        .task_service
-        .update_task_progress(&req, &user_id)
-        .map_err(task_service_status)?;
+    match state.task_service.update_task_progress(&req, &user_id) {
+        Ok(()) => {}
+        Err(TaskServiceError::NotFound) => {
+            tracing::warn!(
+                task_id = %req.task_id,
+                user_id = %user_id,
+                "task not found, did you forget to call /api/task/start first?"
+            );
+            return Err(StatusCode::NOT_FOUND);
+        }
+        Err(error) => return Err(task_service_status(error)),
+    }
     Ok(Json(json!({"status": "ok"})))
 }
 

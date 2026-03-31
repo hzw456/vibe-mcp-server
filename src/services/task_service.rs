@@ -1,10 +1,36 @@
 use crate::models::{Task, TaskStageHistory, TaskStatus};
 use crate::utils::helpers::{now_millis, validate_status};
+use chrono::Utc;
 use serde::Deserialize;
-use sqlx::{mysql::MySqlPoolOptions, MySql, Pool, Row};
+use sqlx::{mysql::{MySqlPoolOptions, MySqlRow}, MySql, Pool, Row};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Deserialize, Default)]
+pub struct StartTaskRequest {
+    pub task_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub ide: Option<String>,
+    #[serde(default)]
+    pub window_title: Option<String>,
+    #[serde(default)]
+    pub project_path: Option<String>,
+    #[serde(default)]
+    pub active_file: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub start_time: Option<i64>,
+    #[serde(default)]
+    pub estimated_duration_ms: Option<i64>,
+    #[serde(default)]
+    pub current_stage: Option<String>,
+    #[serde(default)]
+    pub is_focused: Option<bool>,
+}
 
 #[derive(Debug, Deserialize, Default)]
 pub struct UpdateStateRequest {
@@ -79,21 +105,16 @@ pub struct TaskService {
 
 impl TaskService {
     pub fn new(db_url: String) -> Self {
-        let (tasks, stage_histories) = if db_url.is_empty() {
-            (HashMap::new(), HashMap::new())
-        } else {
-            (
-                Self::load_tasks_from_db(&db_url),
-                Self::load_stage_histories_from_db(&db_url),
-            )
-        };
-
         Self {
-            tasks: Arc::new(Mutex::new(tasks)),
-            stage_histories: Arc::new(Mutex::new(stage_histories)),
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            stage_histories: Arc::new(Mutex::new(HashMap::new())),
             db: None,
             db_url,
         }
+    }
+
+    fn uses_database(&self) -> bool {
+        true
     }
 
     fn normalized_stage(stage: Option<&str>) -> Option<String> {
@@ -216,6 +237,58 @@ impl TaskService {
         }
     }
 
+    fn task_from_row(row: MySqlRow) -> Option<Task> {
+        let status = row
+            .try_get::<String, _>("status")
+            .ok()
+            .and_then(|value| validate_status(&value))
+            .unwrap_or(TaskStatus::Armed);
+
+        let id: String = match row.try_get("id") {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::warn!("Skipping task row without valid id: {}", error);
+                return None;
+            }
+        };
+
+        let mut task = Task {
+            id: id.clone(),
+            user_id: row.try_get("user_id").unwrap_or_default(),
+            name: row.try_get("name").unwrap_or_else(|_| id.clone()),
+            created_at: row
+                .try_get::<Option<i64>, _>("created_at")
+                .ok()
+                .flatten()
+                .unwrap_or(0),
+            is_focused: row.try_get("is_focused").unwrap_or(false),
+            ide: row.try_get("ide").unwrap_or_else(|_| "IDE".to_string()),
+            window_title: row.try_get("window_title").unwrap_or_else(|_| id.clone()),
+            project_path: row.try_get("project_path").ok(),
+            active_file: row.try_get("active_file").ok(),
+            status,
+            source: row.try_get("source").unwrap_or_else(|_| "mcp".to_string()),
+            start_time: row
+                .try_get::<Option<i64>, _>("start_time")
+                .ok()
+                .flatten()
+                .unwrap_or(0),
+            end_time: row.try_get::<Option<i64>, _>("end_time").ok().flatten(),
+            last_heartbeat: row
+                .try_get::<Option<i64>, _>("last_heartbeat")
+                .ok()
+                .flatten()
+                .unwrap_or(0),
+            estimated_duration: row
+                .try_get::<Option<i64>, _>("estimated_duration_ms")
+                .ok()
+                .flatten(),
+            current_stage: row.try_get("current_stage").ok(),
+        };
+        Self::normalize_task(&mut task, now_millis());
+        Some(task)
+    }
+
     fn record_stage_history_in_memory(
         &self,
         task_id: &str,
@@ -258,7 +331,150 @@ impl TaskService {
         });
     }
 
+    fn query_tasks_from_db(
+        db_url: &str,
+        user_id: Option<&str>,
+        history_only: bool,
+    ) -> Vec<Task> {
+        let db_url = db_url.to_string();
+        let user_id = user_id.map(ToOwned::to_owned);
+
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!("Failed to create DB runtime for task query: {}", error);
+                    return Vec::new();
+                }
+            };
+
+            runtime.block_on(async move {
+                let pool = match MySqlPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&db_url)
+                    .await
+                {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        tracing::warn!("Failed to connect to database during task query: {}", error);
+                        return Vec::new();
+                    }
+                };
+
+                let base_query = "SELECT id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage, ide, window_title, project_path, active_file, is_focused, created_at FROM vibe_tasks";
+                let rows = match (user_id.as_deref(), history_only) {
+                    (Some(uid), true) => {
+                        sqlx::query(&format!(
+                            "{} WHERE user_id = ? AND status IN ('completed', 'cancelled', 'error')",
+                            base_query
+                        ))
+                        .bind(uid)
+                        .fetch_all(&pool)
+                        .await
+                    }
+                    (Some(uid), false) => {
+                        sqlx::query(&format!("{} WHERE user_id = ?", base_query))
+                            .bind(uid)
+                            .fetch_all(&pool)
+                            .await
+                    }
+                    (None, true) => {
+                        sqlx::query(&format!(
+                            "{} WHERE status IN ('completed', 'cancelled', 'error')",
+                            base_query
+                        ))
+                        .fetch_all(&pool)
+                        .await
+                    }
+                    (None, false) => sqlx::query(base_query).fetch_all(&pool).await,
+                };
+
+                let mut tasks: Vec<Task> = match rows {
+                    Ok(rows) => rows.into_iter().filter_map(Self::task_from_row).collect(),
+                    Err(error) => {
+                        tracing::warn!("Failed to query tasks from database: {}", error);
+                        return Vec::new();
+                    }
+                };
+
+                tasks.sort_by(|a, b| {
+                    Self::sort_timestamp(b)
+                        .cmp(&Self::sort_timestamp(a))
+                        .then_with(|| b.created_at.cmp(&a.created_at))
+                        .then_with(|| b.id.cmp(&a.id))
+                });
+                tasks
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| {
+            tracing::warn!("Task query thread panicked");
+            Vec::new()
+        })
+    }
+
+    fn query_task_from_db(db_url: &str, task_id: &str, user_id: &str) -> Option<Task> {
+        let db_url = db_url.to_string();
+        let task_id = task_id.to_string();
+        let user_id = user_id.to_string();
+
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!("Failed to create DB runtime for task lookup: {}", error);
+                    return None;
+                }
+            };
+
+            runtime.block_on(async move {
+                let pool = match MySqlPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&db_url)
+                    .await
+                {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        tracing::warn!("Failed to connect to database during task lookup: {}", error);
+                        return None;
+                    }
+                };
+
+                match sqlx::query(
+                    "SELECT id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage, ide, window_title, project_path, active_file, is_focused, created_at FROM vibe_tasks WHERE id = ? AND user_id = ? LIMIT 1"
+                )
+                .bind(&task_id)
+                .bind(&user_id)
+                .fetch_optional(&pool)
+                .await
+                {
+                    Ok(Some(row)) => Self::task_from_row(row),
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::warn!("Failed to load task {} from database: {}", task_id, error);
+                        None
+                    }
+                }
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| {
+            tracing::warn!("Task lookup thread panicked");
+            None
+        })
+    }
+
     pub fn get_task_stage_history(&self, task_id: &str) -> Vec<TaskStageHistory> {
+        if self.uses_database() {
+            return Self::load_stage_history_from_db(&self.db_url, task_id);
+        }
+
         if let Some(history) = self.stage_histories.lock().unwrap().get(task_id).cloned() {
             return history;
         }
@@ -275,6 +491,43 @@ impl TaskService {
                 .insert(task_id.to_string(), history.clone());
         }
         history
+    }
+
+    fn persist_task_and_stage_history_blocking(
+        &self,
+        task: Task,
+        stage_event: Option<StageEvent>,
+        stage_started_at: i64,
+        stage_finalize_at: Option<i64>,
+    ) {
+        let db_url = self.db_url.clone();
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!("Failed to create DB runtime for task persist: {}", error);
+                    return;
+                }
+            };
+
+            runtime.block_on(async move {
+                Self::persist_task_and_stage_history(
+                    db_url,
+                    task,
+                    stage_event,
+                    stage_started_at,
+                    stage_finalize_at,
+                )
+                .await;
+            });
+        })
+        .join()
+        .unwrap_or_else(|_| {
+            tracing::warn!("Task persist thread panicked");
+        });
     }
 
     async fn persist_task_and_stage_history(
@@ -309,7 +562,7 @@ impl TaskService {
                 .bind(&task.project_path)
                 .bind(&task.active_file)
                 .bind(task.is_focused)
-                .bind(task.created_at)
+                .bind(chrono::DateTime::from_timestamp_millis(task.created_at).unwrap().format("%Y-%m-%d %H:%M:%S").to_string())  // Format for MySQL TIMESTAMP
                 .execute(&mut *tx)
                 .await;
 
@@ -354,180 +607,6 @@ impl TaskService {
                 let _ = tx.commit().await;
             }
         }
-    }
-
-    fn load_tasks_from_db(db_url: &str) -> HashMap<String, Task> {
-        let db_url = db_url.to_string();
-        std::thread::spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    tracing::warn!("Failed to create startup DB runtime: {}", error);
-                    return HashMap::new();
-                }
-            };
-
-            runtime.block_on(async move {
-                let pool = match MySqlPoolOptions::new()
-                    .max_connections(1)
-                    .connect(&db_url)
-                    .await
-                {
-                    Ok(pool) => pool,
-                    Err(error) => {
-                        tracing::warn!("Failed to connect to database during task load: {}", error);
-                        return HashMap::new();
-                    }
-                };
-
-                let rows = match sqlx::query(
-                    "SELECT id, user_id, name, status, source, start_time, end_time, last_heartbeat, estimated_duration_ms, current_stage, ide, window_title, project_path, active_file, is_focused, created_at FROM vibe_tasks"
-                )
-                .fetch_all(&pool)
-                .await
-                {
-                    Ok(rows) => rows,
-                    Err(error) => {
-                        tracing::warn!("Failed to load tasks from database: {}", error);
-                        return HashMap::new();
-                    }
-                };
-
-                let mut tasks = HashMap::with_capacity(rows.len());
-                for row in rows {
-                    let status = row
-                        .try_get::<String, _>("status")
-                        .ok()
-                        .and_then(|value| validate_status(&value))
-                        .unwrap_or(TaskStatus::Armed);
-
-                    let id: String = match row.try_get("id") {
-                        Ok(id) => id,
-                        Err(error) => {
-                            tracing::warn!("Skipping task row without valid id: {}", error);
-                            continue;
-                        }
-                    };
-
-                    let mut task = Task {
-                        id: id.clone(),
-                        user_id: row.try_get("user_id").unwrap_or_default(),
-                        name: row.try_get("name").unwrap_or_else(|_| id.clone()),
-                        created_at: row
-                            .try_get::<Option<i64>, _>("created_at")
-                            .ok()
-                            .flatten()
-                            .unwrap_or(0),
-                        is_focused: row.try_get("is_focused").unwrap_or(false),
-                        ide: row.try_get("ide").unwrap_or_else(|_| "IDE".to_string()),
-                        window_title: row.try_get("window_title").unwrap_or_else(|_| id.clone()),
-                        project_path: row.try_get("project_path").ok(),
-                        active_file: row.try_get("active_file").ok(),
-                        status,
-                        source: row.try_get("source").unwrap_or_else(|_| "mcp".to_string()),
-                        start_time: row.try_get::<Option<i64>, _>("start_time").ok().flatten().unwrap_or(0),
-                        end_time: row.try_get::<Option<i64>, _>("end_time").ok().flatten(),
-                        last_heartbeat: row
-                            .try_get::<Option<i64>, _>("last_heartbeat")
-                            .ok()
-                            .flatten()
-                            .unwrap_or(0),
-                        estimated_duration: row
-                            .try_get::<Option<i64>, _>("estimated_duration_ms")
-                            .ok()
-                            .flatten(),
-                        current_stage: row.try_get("current_stage").ok(),
-                    };
-                    Self::normalize_task(&mut task, now_millis());
-
-                    tasks.insert(id, task);
-                }
-
-                tracing::info!("Loaded {} tasks from database", tasks.len());
-                tasks
-            })
-        })
-        .join()
-        .unwrap_or_else(|_| {
-            tracing::warn!("Task loading thread panicked during startup");
-            HashMap::new()
-        })
-    }
-
-    fn load_stage_histories_from_db(db_url: &str) -> HashMap<String, Vec<TaskStageHistory>> {
-        let db_url = db_url.to_string();
-        std::thread::spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    tracing::warn!("Failed to create startup DB runtime for stage history: {}", error);
-                    return HashMap::new();
-                }
-            };
-
-            runtime.block_on(async move {
-                let pool = match MySqlPoolOptions::new()
-                    .max_connections(1)
-                    .connect(&db_url)
-                    .await
-                {
-                    Ok(pool) => pool,
-                    Err(error) => {
-                        tracing::warn!(
-                            "Failed to connect to database during stage history load: {}",
-                            error
-                        );
-                        return HashMap::new();
-                    }
-                };
-
-                let rows = match sqlx::query(
-                    "SELECT task_id, stage, description, started_at, ended_at, duration FROM vibe_task_stages ORDER BY task_id ASC, started_at ASC, id ASC"
-                )
-                .fetch_all(&pool)
-                .await
-                {
-                    Ok(rows) => rows,
-                    Err(error) => {
-                        tracing::warn!("Failed to load stage histories from database: {}", error);
-                        return HashMap::new();
-                    }
-                };
-
-                let mut histories: HashMap<String, Vec<TaskStageHistory>> = HashMap::new();
-                for row in rows {
-                    let task_id: String = match row.try_get("task_id") {
-                        Ok(task_id) => task_id,
-                        Err(error) => {
-                            tracing::warn!("Skipping stage row without valid task_id: {}", error);
-                            continue;
-                        }
-                    };
-
-                    histories.entry(task_id.clone()).or_default().push(TaskStageHistory {
-                        task_id,
-                        stage: row.try_get("stage").unwrap_or_default(),
-                        description: row.try_get("description").ok(),
-                        started_at: row.try_get("started_at").unwrap_or(0),
-                        ended_at: row.try_get("ended_at").ok(),
-                        duration: row.try_get("duration").ok(),
-                    });
-                }
-
-                histories
-            })
-        })
-        .join()
-        .unwrap_or_else(|_| {
-            tracing::warn!("Stage history loading thread panicked during startup");
-            HashMap::new()
-        })
     }
 
     fn load_stage_history_from_db(db_url: &str, task_id: &str) -> Vec<TaskStageHistory> {
@@ -616,6 +695,10 @@ impl TaskService {
     }
 
     pub fn get_tasks(&self, user_id: Option<&str>) -> Vec<Task> {
+        if self.uses_database() {
+            return Self::query_tasks_from_db(&self.db_url, user_id, false);
+        }
+
         let tasks = self.tasks.lock().unwrap();
         let mut tasks_vec: Vec<Task> = if let Some(uid) = user_id {
             tasks
@@ -635,7 +718,40 @@ impl TaskService {
         tasks_vec
     }
 
+    pub fn get_history_tasks(&self, user_id: Option<&str>) -> Vec<Task> {
+        if self.uses_database() {
+            return Self::query_tasks_from_db(&self.db_url, user_id, true);
+        }
+
+        let tasks = self.tasks.lock().unwrap();
+        let mut tasks_vec: Vec<Task> = if let Some(uid) = user_id {
+            tasks
+                .values()
+                .filter(|t| &t.user_id == uid)
+                .filter(|t| matches!(t.status, TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::Error))
+                .cloned()
+                .collect()
+        } else {
+            tasks
+                .values()
+                .filter(|t| matches!(t.status, TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::Error))
+                .cloned()
+                .collect()
+        };
+        tasks_vec.sort_by(|a, b| {
+            Self::sort_timestamp(b)
+                .cmp(&Self::sort_timestamp(a))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        tasks_vec
+    }
+
     pub fn get_task(&self, task_id: &str, user_id: &str) -> Option<Task> {
+        if self.uses_database() {
+            return Self::query_task_from_db(&self.db_url, task_id, user_id);
+        }
+
         let tasks = self.tasks.lock().unwrap();
         tasks
             .get(task_id)
@@ -643,11 +759,202 @@ impl TaskService {
             .cloned()
     }
 
+    pub fn start_task(
+        &self,
+        req: &StartTaskRequest,
+        user_id: &str,
+    ) -> Result<(), TaskServiceError> {
+        let now = now_millis();
+        let mut task = if self.uses_database() {
+            Self::query_task_from_db(&self.db_url, &req.task_id, user_id).unwrap_or_else(|| {
+                Task::new(
+                    req.task_id.clone(),
+                    user_id.to_string(),
+                    req.name.clone().unwrap_or_else(|| req.task_id.clone()),
+                    req.ide.clone().unwrap_or_else(|| "IDE".to_string()),
+                    req.window_title.clone().unwrap_or_else(|| req.name.clone().unwrap_or_else(|| req.task_id.clone())),
+                )
+            })
+        } else {
+            let mut tasks = self.tasks.lock().unwrap();
+            let task = tasks.entry(req.task_id.clone()).or_insert_with(|| {
+                Task::new(
+                    req.task_id.clone(),
+                    user_id.to_string(),
+                    req.name.clone().unwrap_or_else(|| req.task_id.clone()),
+                    req.ide.clone().unwrap_or_else(|| "IDE".to_string()),
+                    req.window_title.clone().unwrap_or_else(|| req.name.clone().unwrap_or_else(|| req.task_id.clone())),
+                )
+            });
+            if task.user_id != user_id {
+                return Err(TaskServiceError::NotFound);
+            }
+            task.clone()
+        };
+
+        if task.user_id != user_id {
+            return Err(TaskServiceError::NotFound);
+        }
+
+        if let Some(name) = &req.name {
+            task.name = name.clone();
+        }
+        if let Some(ide) = &req.ide {
+            task.ide = ide.clone();
+        }
+        if let Some(window_title) = &req.window_title {
+            task.window_title = window_title.clone();
+        }
+        if let Some(project_path) = &req.project_path {
+            task.project_path = Some(project_path.clone());
+        }
+        if let Some(active_file) = &req.active_file {
+            task.active_file = Some(active_file.clone());
+        }
+        if let Some(source) = &req.source {
+            task.source = source.clone();
+        } else if task.source.is_empty() {
+            task.source = "mcp".to_string();
+        }
+        if let Some(estimated_duration_ms) = req.estimated_duration_ms {
+            task.estimated_duration = Some(estimated_duration_ms);
+        }
+        if let Some(current_stage) = &req.current_stage {
+            task.current_stage = Some(current_stage.clone());
+        }
+        if let Some(is_focused) = req.is_focused {
+            task.is_focused = is_focused;
+        }
+
+        task.status = TaskStatus::Armed;
+        task.start_time = req.start_time.unwrap_or(0);
+        task.end_time = None;
+        task.last_heartbeat = now;
+        if task.created_at <= 0 {
+            task.created_at = now;
+        }
+        Self::normalize_task(&mut task, now);
+
+        if self.uses_database() {
+            self.persist_task_and_stage_history_blocking(task, None, now, None);
+        } else {
+            let task_clone = task.clone();
+            self.tasks.lock().unwrap().insert(task_clone.id.clone(), task_clone.clone());
+            let db_url = self.db_url.clone();
+            if !db_url.is_empty() {
+                tokio::spawn(async move {
+                    Self::persist_task_and_stage_history(db_url, task_clone, None, now, None).await;
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn update_task_status(
         &self,
         req: &UpdateStateRequest,
         user_id: &str,
     ) -> Result<(), TaskServiceError> {
+        if self.uses_database() {
+            let mut task = Self::query_task_from_db(&self.db_url, &req.task_id, user_id)
+                .unwrap_or_else(|| {
+                    Task::new(
+                        req.task_id.clone(),
+                        user_id.to_string(),
+                        req.task_id.clone(),
+                        "IDE".to_string(),
+                        req.task_id.clone(),
+                    )
+                });
+
+            let now = now_millis();
+            let mut history_status = None;
+            if let Some(status_str) = &req.status {
+                let new_status = validate_status(status_str)
+                    .ok_or_else(|| TaskServiceError::InvalidStatus(status_str.clone()))?;
+                history_status = Some(new_status);
+                task.status = new_status;
+
+                match new_status {
+                    TaskStatus::Running => {
+                        if let Some(start_time) = req.start_time {
+                            task.start_time = start_time;
+                        } else if task.start_time == 0 {
+                            task.start_time = now;
+                        }
+                    }
+                    TaskStatus::Completed | TaskStatus::Error | TaskStatus::Cancelled => {
+                        task.end_time = Some(req.end_time.unwrap_or(now));
+                        if new_status == TaskStatus::Completed {
+                            task.current_stage = Some("__completed__".to_string());
+                        }
+                    }
+                    TaskStatus::Armed => {
+                        task.estimated_duration = None;
+                        task.current_stage = None;
+                    }
+                }
+            }
+
+            if let Some(start_time) = req.start_time {
+                task.start_time = start_time;
+            }
+            if let Some(est) = req.estimated_duration {
+                task.estimated_duration = Some(est);
+            }
+            if let Some(est) = req.estimated_duration_ms {
+                task.estimated_duration = Some(est);
+            }
+            if let Some(end_time) = req.end_time {
+                task.end_time = Some(end_time);
+            }
+            if let Some(stage) = &req.current_stage {
+                task.current_stage = Some(stage.clone());
+            }
+            if let Some(source) = &req.source {
+                task.source = source.clone();
+            }
+            if let Some(window_title) = &req.window_title {
+                task.window_title = window_title.clone();
+            }
+            if let Some(active_file) = &req.active_file {
+                task.active_file = Some(active_file.clone());
+            }
+            if let Some(project_path) = &req.project_path {
+                task.project_path = Some(project_path.clone());
+            }
+            if let Some(is_focused) = req.is_focused {
+                task.is_focused = is_focused;
+            }
+
+            task.last_heartbeat = now;
+            Self::normalize_task(&mut task, now);
+
+            let stage_event =
+                Self::stage_event_for_state(req, history_status, task.current_stage.as_deref());
+            let stage_started_at = if Self::should_finalize_stage(history_status) {
+                task.end_time.unwrap_or(now)
+            } else if history_status == Some(TaskStatus::Running) && task.start_time > 0 {
+                task.start_time
+            } else {
+                now
+            };
+            let stage_finalize_at = if Self::should_finalize_stage(history_status) {
+                Some(stage_started_at)
+            } else {
+                None
+            };
+
+            self.persist_task_and_stage_history_blocking(
+                task,
+                stage_event,
+                stage_started_at,
+                stage_finalize_at,
+            );
+            return Ok(());
+        }
+
         let mut tasks = self.tasks.lock().unwrap();
 
         let task = tasks.entry(req.task_id.clone()).or_insert_with(|| {
@@ -777,6 +1084,40 @@ impl TaskService {
         req: &UpdateProgressRequest,
         user_id: &str,
     ) -> Result<(), TaskServiceError> {
+        if self.uses_database() {
+            let mut task = Self::query_task_from_db(&self.db_url, &req.task_id, user_id)
+                .ok_or(TaskServiceError::NotFound)?;
+
+            let now = now_millis();
+            if let Some(est) = req.estimated_duration_ms {
+                task.estimated_duration = Some(est);
+            }
+            if let Some(stage) = &req.current_stage {
+                task.current_stage = Some(stage.clone());
+            }
+            if let Some(active_file) = &req.active_file {
+                task.active_file = Some(active_file.clone());
+            }
+            if let Some(window_title) = &req.window_title {
+                task.window_title = window_title.clone();
+            }
+            if let Some(is_focused) = req.is_focused {
+                task.is_focused = is_focused;
+            }
+
+            task.last_heartbeat = now;
+            Self::normalize_task(&mut task, now);
+
+            let stage_event = Self::stage_event_for_progress(
+                req,
+                task.current_stage.as_deref(),
+                task.active_file.as_deref(),
+            );
+
+            self.persist_task_and_stage_history_blocking(task, stage_event, now, None);
+            return Ok(());
+        }
+
         let mut tasks = self.tasks.lock().unwrap();
 
         let task = tasks
@@ -838,26 +1179,211 @@ impl TaskService {
     }
 
     pub fn reset_tasks(&self, task_id: Option<String>, user_id: &str) {
+        if self.uses_database() {
+            let db_url = self.db_url.clone();
+            let user_id = user_id.to_string();
+            std::thread::spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        tracing::warn!("Failed to create DB runtime for task reset: {}", error);
+                        return;
+                    }
+                };
+
+                runtime.block_on(async move {
+                    let pool = match MySqlPoolOptions::new()
+                        .max_connections(1)
+                        .connect(&db_url)
+                        .await
+                    {
+                        Ok(pool) => pool,
+                        Err(error) => {
+                            tracing::warn!("Failed to connect to database during task reset: {}", error);
+                            return;
+                        }
+                    };
+
+                    let mut tx = match pool.begin().await {
+                        Ok(tx) => tx,
+                        Err(error) => {
+                            tracing::warn!("Failed to start task reset transaction: {}", error);
+                            return;
+                        }
+                    };
+
+                    if let Some(task_id) = task_id {
+                        if sqlx::query(
+                            "DELETE s FROM vibe_task_stages s INNER JOIN vibe_tasks t ON t.id = s.task_id WHERE t.id = ? AND t.user_id = ?"
+                        )
+                        .bind(&task_id)
+                        .bind(&user_id)
+                        .execute(&mut *tx)
+                        .await
+                        .is_err()
+                        {
+                            let _ = tx.rollback().await;
+                            return;
+                        }
+
+                        if sqlx::query("DELETE FROM vibe_tasks WHERE id = ? AND user_id = ?")
+                            .bind(&task_id)
+                            .bind(&user_id)
+                            .execute(&mut *tx)
+                            .await
+                            .is_err()
+                        {
+                            let _ = tx.rollback().await;
+                            return;
+                        }
+                    } else {
+                        if sqlx::query(
+                            "DELETE s FROM vibe_task_stages s INNER JOIN vibe_tasks t ON t.id = s.task_id WHERE t.user_id = ?"
+                        )
+                        .bind(&user_id)
+                        .execute(&mut *tx)
+                        .await
+                        .is_err()
+                        {
+                            let _ = tx.rollback().await;
+                            return;
+                        }
+
+                        if sqlx::query("DELETE FROM vibe_tasks WHERE user_id = ?")
+                            .bind(&user_id)
+                            .execute(&mut *tx)
+                            .await
+                            .is_err()
+                        {
+                            let _ = tx.rollback().await;
+                            return;
+                        }
+                    }
+
+                    let _ = tx.commit().await;
+                });
+            })
+            .join()
+            .unwrap_or_else(|_| {
+                tracing::warn!("Task reset thread panicked");
+            });
+            return;
+        }
+
         let mut tasks = self.tasks.lock().unwrap();
+        let mut histories = self.stage_histories.lock().unwrap();
         match task_id {
             Some(id) => {
                 if let Some(task) = tasks.get(&id) {
                     if task.user_id == user_id {
                         tasks.remove(&id);
+                        histories.remove(&id);
                     }
                 }
             }
             None => {
+                let removed_ids: Vec<String> = tasks
+                    .iter()
+                    .filter(|(_, task)| task.user_id == user_id)
+                    .map(|(id, _)| id.clone())
+                    .collect();
                 tasks.retain(|_, t| t.user_id != user_id);
+                for id in removed_ids {
+                    histories.remove(&id);
+                }
             }
         }
     }
 
     pub fn delete_task(&self, task_id: &str, user_id: &str) -> bool {
+        if self.uses_database() {
+            let db_url = self.db_url.clone();
+            let task_id = task_id.to_string();
+            let user_id = user_id.to_string();
+            return std::thread::spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        tracing::warn!("Failed to create DB runtime for task delete: {}", error);
+                        return false;
+                    }
+                };
+
+                runtime.block_on(async move {
+                    let pool = match MySqlPoolOptions::new()
+                        .max_connections(1)
+                        .connect(&db_url)
+                        .await
+                    {
+                        Ok(pool) => pool,
+                        Err(error) => {
+                            tracing::warn!("Failed to connect to database during task delete: {}", error);
+                            return false;
+                        }
+                    };
+
+                    let mut tx = match pool.begin().await {
+                        Ok(tx) => tx,
+                        Err(error) => {
+                            tracing::warn!("Failed to start task delete transaction: {}", error);
+                            return false;
+                        }
+                    };
+
+                    let delete_stages = sqlx::query(
+                        "DELETE s FROM vibe_task_stages s INNER JOIN vibe_tasks t ON t.id = s.task_id WHERE t.id = ? AND t.user_id = ?"
+                    )
+                    .bind(&task_id)
+                    .bind(&user_id)
+                    .execute(&mut *tx)
+                    .await;
+
+                    if delete_stages.is_err() {
+                        let _ = tx.rollback().await;
+                        return false;
+                    }
+
+                    let deleted = match sqlx::query("DELETE FROM vibe_tasks WHERE id = ? AND user_id = ?")
+                        .bind(&task_id)
+                        .bind(&user_id)
+                        .execute(&mut *tx)
+                        .await
+                    {
+                        Ok(result) => result.rows_affected() > 0,
+                        Err(_) => {
+                            let _ = tx.rollback().await;
+                            return false;
+                        }
+                    };
+
+                    if tx.commit().await.is_err() {
+                        return false;
+                    }
+
+                    deleted
+                })
+            })
+            .join()
+            .unwrap_or_else(|_| {
+                tracing::warn!("Task delete thread panicked");
+                false
+            });
+        }
+
         let mut tasks = self.tasks.lock().unwrap();
         if let Some(task) = tasks.get(task_id) {
             if task.user_id == user_id {
-                return tasks.remove(task_id).is_some();
+                let removed = tasks.remove(task_id).is_some();
+                if removed {
+                    self.stage_histories.lock().unwrap().remove(task_id);
+                }
+                return removed;
             }
         }
         false

@@ -8,7 +8,7 @@ User=www-data
 WorkingDirectory=/opt/vibe-mcp-server
 Environment="PATH=/opt/vibe-mcp-server/bin"
 EnvironmentFile=/opt/vibe-mcp-server/.env
-ExecStart=/opt/vibe-mcp-server/bin/vibe-mcp-server --host 0.0.0.0 --port 3010
+ExecStart=/opt/vibe-mcp-server/bin/vibe-mcp-server --host 0.0.0.0 --port 3011
 Restart=always
 RestartSec=5
 

@@ -12,6 +12,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use sqlx::mysql::MySqlPoolOptions;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -23,17 +24,39 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Self {
+    pub async fn new(
+        config: Config,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let db_url = config.database_url.clone();
+        if !db_url.is_empty() {
+            let db_url_for_probe = db_url.clone();
+            tokio::spawn(async move {
+                match MySqlPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&db_url_for_probe)
+                    .await
+                {
+                    Ok(pool) => {
+                        tracing::info!("Database probe succeeded during startup");
+                        pool.close().await;
+                    }
+                    Err(error) => {
+                        tracing::warn!("Database probe failed during startup: {}", error);
+                    }
+                }
+            });
+        } else {
+            tracing::warn!("DATABASE_URL is not set; health checks will work, database-backed APIs will not");
+        }
 
         let task_service = TaskService::new(db_url.clone());
         let user_service = UserService::new(db_url);
 
-        Self {
+        Ok(Self {
             config,
             task_service,
             user_service,
-        }
+        })
     }
 }
 
@@ -62,6 +85,7 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::get_task_stage_history),
         )
         .route("/api/task/update_state", post(handlers::update_task_state))
+        .route("/api/task/start", post(handlers::start_task))
         .route(
             "/api/task/update_progress",
             post(handlers::update_task_progress),

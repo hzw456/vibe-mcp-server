@@ -49,94 +49,98 @@ impl Clone for UserService {
 
 impl UserService {
     pub fn new(db_url: String) -> Self {
-        let users = if db_url.is_empty() {
-            HashMap::new()
-        } else {
-            Self::load_users_from_db(&db_url)
-        };
-
-        Self {
-            users: Arc::new(Mutex::new(users)),
+        let service = Self {
+            users: Arc::new(Mutex::new(HashMap::new())),
             verification_codes: Arc::new(Mutex::new(HashMap::new())),
             db: None,
             db_url,
-        }
+        };
+
+        service.refresh_users_from_db_async();
+        service
     }
 
-    fn load_users_from_db(db_url: &str) -> HashMap<String, User> {
-        let db_url = db_url.to_string();
+    fn refresh_users_from_db_async(&self) {
+        if self.db_url.is_empty() {
+            return;
+        }
+
+        let db_url = self.db_url.clone();
+        let users = Arc::clone(&self.users);
+
         std::thread::spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
+            let loaded = Self::load_users_from_db_blocking(&db_url);
+            let mut cache = users.lock().unwrap();
+            *cache = loaded;
+        });
+    }
+
+    fn load_users_from_db_blocking(db_url: &str) -> HashMap<String, User> {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::warn!("Failed to create startup DB runtime: {}", error);
+                return HashMap::new();
+            }
+        };
+
+        runtime.block_on(async move {
+            let pool = match MySqlPoolOptions::new()
+                .max_connections(1)
+                .connect(db_url)
+                .await
             {
-                Ok(runtime) => runtime,
+                Ok(pool) => pool,
                 Err(error) => {
-                    tracing::warn!("Failed to create startup DB runtime: {}", error);
+                    tracing::warn!("Failed to connect to database during user load: {}", error);
                     return HashMap::new();
                 }
             };
 
-            runtime.block_on(async move {
-                let pool = match MySqlPoolOptions::new()
-                    .max_connections(1)
-                    .connect(&db_url)
-                    .await
-                {
-                    Ok(pool) => pool,
-                    Err(error) => {
-                        tracing::warn!("Failed to connect to database during user load: {}", error);
-                        return HashMap::new();
-                    }
-                };
-
-                let rows = match sqlx::query(
-                    "SELECT id, email, password_hash, is_verified, created_at, api_key FROM vibe_users"
-                )
-                .fetch_all(&pool)
-                .await
-                {
-                    Ok(rows) => rows,
-                    Err(error) => {
-                        tracing::warn!("Failed to load users from database: {}", error);
-                        return HashMap::new();
-                    }
-                };
-
-                let mut users = HashMap::with_capacity(rows.len());
-                for row in rows {
-                    let id: String = match row.try_get("id") {
-                        Ok(id) => id,
-                        Err(error) => {
-                            tracing::warn!("Skipping user row without valid id: {}", error);
-                            continue;
-                        }
-                    };
-
-                    let user = User {
-                        id: id.clone(),
-                        email: row.try_get("email").unwrap_or_default(),
-                        password_hash: row.try_get("password_hash").unwrap_or_default(),
-                        created_at: row
-                            .try_get::<Option<i64>, _>("created_at")
-                            .ok()
-                            .flatten()
-                            .unwrap_or(0),
-                        is_verified: row.try_get("is_verified").unwrap_or(false),
-                        api_key: row.try_get("api_key").ok(),
-                    };
-
-                    users.insert(id, user);
+            let rows = match sqlx::query(
+                "SELECT id, email, password_hash, is_verified, created_at, api_key FROM vibe_users",
+            )
+            .fetch_all(&pool)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!("Failed to load users from database: {}", error);
+                    return HashMap::new();
                 }
+            };
 
-                tracing::info!("Loaded {} users from database", users.len());
-                users
-            })
-        })
-        .join()
-        .unwrap_or_else(|_| {
-            tracing::warn!("User loading thread panicked during startup");
-            HashMap::new()
+            let mut users = HashMap::with_capacity(rows.len());
+            for row in rows {
+                let id: String = match row.try_get("id") {
+                    Ok(id) => id,
+                    Err(error) => {
+                        tracing::warn!("Skipping user row without valid id: {}", error);
+                        continue;
+                    }
+                };
+
+                let user = User {
+                    id: id.clone(),
+                    email: row.try_get("email").unwrap_or_default(),
+                    password_hash: row.try_get("password_hash").unwrap_or_default(),
+                    created_at: row
+                        .try_get::<Option<i64>, _>("created_at")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0),
+                    is_verified: row.try_get("is_verified").unwrap_or(false),
+                    api_key: row.try_get("api_key").ok(),
+                };
+
+                users.insert(id, user);
+            }
+
+            tracing::info!("Loaded {} users from database", users.len());
+            users
         })
     }
 
