@@ -75,9 +75,7 @@ pub async fn login(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if !password_valid {
-        return Ok(Json(
-            json!({ "success": false, "error": "Invalid credentials" }),
-        ));
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     let token = AuthService::create_jwt_token(&user, &state.config)
